@@ -1209,6 +1209,62 @@ mod tests {
         assert!(constants.contains(&42.0) && constants.contains(&20.0), "{constants:?}");
     }
 
+    /// A table makes a cell view from the nib registered for its identifier:
+    /// the nib's top-level view of that identifier.
+    #[test]
+    fn a_table_makes_a_cell_view_from_its_registered_nib() {
+        use crate::fixture::{Field, archive};
+        crate::bootstrap();
+        let bytes = archive(
+            "IB.objectdata",
+            &[
+                (
+                    "NSIBObjectData",
+                    vec![
+                        ("NSRoot", Field::Ref(1)),
+                        ("NSObjectsKeys", Field::Ref(2)),
+                        ("NSObjectsValues", Field::Ref(3)),
+                    ],
+                ),
+                ("NSCustomObject", vec![("NSClassName", Field::Text("NSObject"))]),
+                ("NSArray", vec![("NS.objects", Field::Refs(vec![4]))]),
+                ("NSArray", vec![("NS.objects", Field::Refs(vec![1]))]),
+                (
+                    "NSTableCellView",
+                    vec![
+                        ("NSFrame", Field::Text("{{0, 0}, {100, 17}}")),
+                        ("NSReuseIdentifierKey", Field::Text("DataCell")),
+                    ],
+                ),
+            ],
+        );
+        let nib = new_nib(bytes.as_bytes()).expect("NSNib");
+        let class = objc::class::ptr(objc::class::lookup(c"NSTableView").expect("NSTableView"));
+        let table: Id = send(send::<Id>(class as Id, "alloc"), "init");
+        let identifier = foundation::string::from_str("DataCell");
+        // SAFETY: `void (id, SEL, NSNib *, NSString *)` and
+        // `id (id, SEL, NSString *, id)`.
+        let cell = unsafe {
+            let register: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            register(table, objc::sel::get("registerNib:forIdentifier:"), nib, identifier);
+            let make: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            make(
+                table,
+                objc::sel::get("makeViewWithIdentifier:owner:"),
+                identifier,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: a live object.
+        let made = unsafe { objc::object::class_of(cell) }.expect("a view");
+        assert_eq!(made.name_str(), "NSTableCellView");
+        let given: Id = send(cell, "identifier");
+        // SAFETY: a string.
+        assert_eq!(unsafe { foundation::string::bytes(given) }, b"DataCell");
+    }
+
     #[test]
     fn the_owners_outlet_is_wired_to_the_object_the_nib_names() {
         delegate_class();

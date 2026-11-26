@@ -498,6 +498,46 @@ fn table_details(builder: &mut dyn Builder, uid: Uid, view: Id) {
             }
         }
     }
+    if let (Some(width), Some(height)) = (
+        real(builder, uid, "NSIntercellSpacingWidth"),
+        real(builder, uid, "NSIntercellSpacingHeight"),
+    ) {
+        // SAFETY: `-setIntercellSpacing:` takes one `NSSize`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSSize) = std::mem::transmute(objc::msg::entry());
+            f(
+                view,
+                objc::sel::get("setIntercellSpacing:"),
+                NSSize { width, height },
+            );
+        }
+    }
+    if let Some(style) = integer(builder, uid, "NSTableViewSelectionHighlightStyle") {
+        // SAFETY: `-setSelectionHighlightStyle:` takes one `NSInteger`.
+        unsafe { send_integer(view, "setSelectionHighlightStyle:", style as usize) };
+    }
+    if let Some(style) = integer(builder, uid, "NSColumnAutoresizingStyle") {
+        // SAFETY: `-setColumnAutoresizingStyle:` takes one `NSInteger`.
+        unsafe { send_integer(view, "setColumnAutoresizingStyle:", style as usize) };
+    }
+    // A view-based table's cell views, as a nib for each identifier.
+    if let Some(nibs) = builder
+        .archive()
+        .field_object(uid, "NSTableViewArchivedReusableViewsKey")
+    {
+        for (identifier, nib) in builder.archive().dictionary(nibs) {
+            let (Some(identifier), Some(nib)) = (builder.object_at(identifier), builder.object_at(nib))
+            else {
+                continue;
+            };
+            // SAFETY: `-registerNib:forIdentifier:` is `void (id, SEL, NSNib *, NSString *)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) =
+                    std::mem::transmute(objc::msg::entry());
+                f(view, objc::sel::get("registerNib:forIdentifier:"), nib, identifier);
+            }
+        }
+    }
 }
 
 /// `NSTableColumn`: its identifier, width, and the font and alignment of its

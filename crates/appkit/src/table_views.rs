@@ -113,6 +113,10 @@ unsafe extern "C" fn row_set_selected(receiver: Id, sel: Sel, selected: u8) {
 
 unsafe extern "C" fn nothing_in_rect(_receiver: Id, _sel: Sel, _rect: NSRect) {}
 
+unsafe extern "C" fn yes(_receiver: Id, _sel: Sel) -> u8 {
+    1
+}
+
 pub(crate) fn install() {
     let cell = objc::class::lookup(c"NSTableCellView").expect("declared before its methods");
     properties!(cell, {
@@ -147,5 +151,6 @@ pub(crate) fn install() {
         "drawSelectionInRect:" => row_draw_selection, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawSeparatorInRect:" => nothing_in_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawDraggingDestinationFeedbackInRect:" => nothing_in_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "isFlipped" => yes, c"c16@0:8";
     });
 }

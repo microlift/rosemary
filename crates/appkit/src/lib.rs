@@ -77,6 +77,7 @@ pub mod opengl;
 pub mod panel;
 #[cfg(test)]
 mod fixture;
+mod outline;
 mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;
@@ -159,6 +160,7 @@ pub fn bootstrap() {
         matrix::install();
         tab::install();
         table::install();
+        outline::install();
         view_animation::install();
         bezier::install();
         layer::install();

@@ -169,6 +169,8 @@ enum Setter {
     Object(&'static str),
     Bool(&'static str),
     Integer(&'static str),
+    /// A binding with no public setter, kept by this crate.
+    Private(fn(Id, Id)),
 }
 
 /// The setter AppKit's own classes expose a binding through.
@@ -184,6 +186,15 @@ fn setter_for(owner: Id, name: &str) -> Option<Setter> {
         "value" => Setter::Object("setObjectValue:"),
         "contentArray" | "contentObject" if is_kind(owner, c"NSObjectController") => {
             Setter::Object("setContent:")
+        }
+        "content" if is_kind(owner, c"NSTableView") => {
+            Setter::Private(crate::table::set_bound_content)
+        }
+        "selectionIndexPaths" if is_kind(owner, c"NSOutlineView") => {
+            Setter::Private(crate::table::set_bound_selection)
+        }
+        "selectionIndexes" if is_kind(owner, c"NSTableView") => {
+            Setter::Private(crate::table::set_bound_selection)
         }
         "enabled" => Setter::Bool("setEnabled:"),
         "hidden" => Setter::Bool("setHidden:"),
@@ -206,6 +217,7 @@ fn apply(binder: &Binder) {
     let name = text(binder.name);
     let owner = binder.owner;
     match setter_for(owner, &name) {
+        Some(Setter::Private(set)) => set(owner, value),
         Some(Setter::Object(sel)) if responds(owner, sel) => {
             send_id_id(owner, sel, value);
         }
@@ -391,13 +403,35 @@ unsafe extern "C" fn exposed_bindings(_receiver: Id, _sel: Sel) -> Id {
 
 unsafe extern "C" fn expose_binding(_class: Id, _sel: Sel, _name: Id) {}
 
+/// Take `value` back through `owner`'s binding of that name, if it has one,
+/// to the key path it observes.
+pub(crate) fn push(owner: Id, name: &str, mut value: Id) {
+    let Some(binder) = binder_of(owner, name) else {
+        return;
+    };
+    let transformer = transformer(binder);
+    if !transformer.is_null() {
+        value = send_id_id(transformer, "reverseTransformedValue:", value);
+    }
+    // SAFETY: `void (id, SEL, id, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+        f(
+            binder.observed,
+            objc::sel::get("setValue:forKeyPath:"),
+            value,
+            binder.key_path,
+        );
+    }
+}
+
 /// A control the user changed: its `value` binding, if any, takes the new
 /// value back to the observed object.
 pub(crate) fn control_changed(control: Id) {
-    let Some(binder) = binder_of(control, "value") else {
+    if binder_of(control, "value").is_none() {
         return;
-    };
-    let mut value = match is_kind(control, c"NSButton") || is_kind(control, c"NSSwitch") {
+    }
+    let value = match is_kind(control, c"NSButton") || is_kind(control, c"NSSwitch") {
         true => {
             // SAFETY: `NSInteger (id, SEL)` and `id (Class, SEL, NSInteger)`.
             unsafe {
@@ -415,20 +449,7 @@ pub(crate) fn control_changed(control: Id) {
         }
         false => send_id(control, "objectValue"),
     };
-    let transformer = transformer(binder);
-    if !transformer.is_null() {
-        value = send_id_id(transformer, "reverseTransformedValue:", value);
-    }
-    // SAFETY: `void (id, SEL, id, NSString *)`.
-    unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
-        f(
-            binder.observed,
-            objc::sel::get("setValue:forKeyPath:"),
-            value,
-            binder.key_path,
-        );
-    }
+    push(control, "value", value);
 }
 
 // NSUserDefaultsController.
@@ -630,3 +651,4 @@ pub(crate) fn install() {
         "setValue:forKey:" => values_set_value_for_key, c"v32@0:8@16@24";
     });
 }
+

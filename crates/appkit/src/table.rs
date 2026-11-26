@@ -1,10 +1,17 @@
-//! `NSTableView` and `NSTableColumn`, as a read-only list a data source
-//! fills: rows of each column's value, drawn in its font and alignment.
+//! `NSTableView` and `NSTableColumn`, as a read-only list a data source or a
+//! `content` binding fills.
+//!
+//! A cell-based table draws each column's value in its font and alignment. A
+//! view-based one - which registered nibs for its cells, or whose delegate
+//! makes their views - is made of a row view per row holding a view per
+//! column, made whenever the rows change and kept as subviews; the table is
+//! then as tall as its rows, for its scroll view to scroll.
 //!
 //! FIXME (ACCURACY): a click selects one row and drags extend nothing; no
-//! editing, headers or grid are drawn, and a
-//! table that does not fit its clip view shows the rows `-scrollRowToVisible:`
-//! last asked for rather than scrolling.
+//! editing, headers or grid are drawn; a cell-based table that does not fit
+//! its clip view shows the rows `-scrollRowToVisible:` last asked for rather
+//! than scrolling; and a view-based table makes every row's views, not only
+//! the visible ones, and reuses none of them.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -39,6 +46,16 @@ struct Table {
     clicked: Option<(isize, isize)>,
     /// Unretained: the header view is in the scroll view's tree, which holds it.
     header: usize,
+    /// Retained: what a `content` binding gives the table - the arranged
+    /// objects of a table, the root tree node of an outline - or zero.
+    content: usize,
+    /// The row views of a view-based table, each retained, by row.
+    row_views: Vec<usize>,
+    /// The top of each row of a view-based table, and the bottom of the last.
+    row_tops: Vec<f64>,
+    spacing_width: f64,
+    /// `NSTableViewColumnAutoresizingStyle`.
+    autoresizing_style: isize,
 }
 
 #[derive(Clone, Default)]
@@ -73,6 +90,7 @@ fn table(receiver: Id) -> Table {
         .unwrap_or(Table {
             row_height: 17.0,
             spacing_height: 2.0,
+            spacing_width: 3.0,
             ..Default::default()
         })
 }
@@ -118,13 +136,74 @@ pub(crate) fn forget(receiver: Id) {
         table
             .columns
             .into_iter()
-            .for_each(|c| objc::arc::release(c as Id));
-        objc::arc::release(table.background as Id);
+            .chain(table.row_views)
+            .chain([table.background, table.content])
+            .for_each(|o| objc::arc::release(o as Id));
     }
+    crate::outline::forget(receiver);
+}
+
+pub(crate) fn bound_content(receiver: Id) -> Id {
+    table(receiver).content as Id
+}
+
+pub(crate) fn data_source_of(receiver: Id) -> Id {
+    table(receiver).data_source as Id
+}
+
+pub(crate) fn delegate_of(receiver: Id) -> Id {
+    table(receiver).delegate as Id
+}
+
+pub(crate) fn column_index(receiver: Id, column: Id) -> Option<usize> {
+    table(receiver).columns.iter().position(|c| *c == column as usize)
+}
+
+pub(crate) fn column_at(receiver: Id, index: usize) -> Id {
+    table(receiver).columns.get(index).copied().unwrap_or(0) as Id
+}
+
+/// The `content` binding's value: a table's arranged objects, or the root
+/// node of an outline's tree.
+pub(crate) fn set_bound_content(receiver: Id, content: Id) {
+    let mut old = std::ptr::null_mut();
+    update_table(receiver, |t| old = swap_retained(&mut t.content, content));
+    objc::arc::release(old);
+    reload(receiver);
+}
+
+/// The `selectionIndexPaths` binding of an outline, or the
+/// `selectionIndexes` binding of a table.
+pub(crate) fn set_bound_selection(receiver: Id, value: Id) {
+    let rows = match crate::outline::is_outline(receiver) {
+        true => crate::outline::rows_of_paths(receiver, value),
+        false => index_set_members(value),
+    };
+    change_selection(receiver, rows, Origin::Binding);
+}
+
+/// Work out the rows again and lay them out.
+fn reload(receiver: Id) {
+    if crate::outline::is_outline(receiver) {
+        crate::outline::rebuild_rows(receiver);
+    }
+    rows_changed(receiver);
+}
+
+/// The rows changed: a view-based table makes their views again, and the
+/// selection keeps only rows that still exist.
+pub(crate) fn rows_changed(receiver: Id) {
+    let count = rows(receiver);
+    update_table(receiver, |t| t.selected.retain(|row| *row < count));
+    if is_view_based(receiver) {
+        tile(receiver);
+    }
+    crate::backing::needs_display(receiver);
 }
 
 unsafe extern "C" fn set_data_source(receiver: Id, _sel: Sel, source: Id) {
     update_table(receiver, |t| t.data_source = source as usize);
+    reload(receiver);
 }
 
 unsafe extern "C" fn data_source(receiver: Id, _sel: Sel) -> Id {
@@ -133,6 +212,9 @@ unsafe extern "C" fn data_source(receiver: Id, _sel: Sel) -> Id {
 
 unsafe extern "C" fn set_delegate(receiver: Id, _sel: Sel, delegate: Id) {
     update_table(receiver, |t| t.delegate = delegate as usize);
+    if is_view_based(receiver) {
+        tile(receiver);
+    }
 }
 
 unsafe extern "C" fn delegate(receiver: Id, _sel: Sel) -> Id {
@@ -190,6 +272,13 @@ unsafe extern "C" fn number_of_rows(receiver: Id, _sel: Sel) -> isize {
 }
 
 fn rows(receiver: Id) -> isize {
+    if crate::outline::is_outline(receiver) {
+        return crate::outline::row_count(receiver);
+    }
+    let content = bound_content(receiver);
+    if !content.is_null() {
+        return crate::tree_controller::send_word(content, "count") as isize;
+    }
     let source = table(receiver).data_source as Id;
     let sel = objc::sel::get("numberOfRowsInTableView:");
     if !responds(source, sel) {
@@ -207,19 +296,51 @@ fn responds(object: Id, sel: Sel) -> bool {
     unsafe { objc::object::class_of(object) }.is_some_and(|c| c.method(sel).is_some())
 }
 
-/// The value at `row` of `column`, as the text the cell would show.
-fn value(receiver: Id, column: Id, row: isize) -> String {
+/// Whether anything gives the rows object values: a `content` binding or the
+/// data source.
+fn has_object_values(receiver: Id) -> bool {
+    let source = table(receiver).data_source as Id;
+    !bound_content(receiver).is_null()
+        || responds(
+            source,
+            objc::sel::get(match crate::outline::is_outline(receiver) {
+                true => "outlineView:objectValueForTableColumn:byItem:",
+                false => "tableView:objectValueForTableColumn:row:",
+            }),
+        )
+}
+
+/// The object at `row` of `column`: the bound content's, or the data
+/// source's.
+fn object_value(receiver: Id, column: Id, row: isize) -> Id {
+    if crate::outline::is_outline(receiver) {
+        return crate::outline::object_value(receiver, column, row);
+    }
+    let content = bound_content(receiver);
+    if !content.is_null() {
+        // SAFETY: `id (id, SEL, NSUInteger)`.
+        return unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(content, objc::sel::get("objectAtIndex:"), row as usize)
+        };
+    }
     let source = table(receiver).data_source as Id;
     let sel = objc::sel::get("tableView:objectValueForTableColumn:row:");
     if !responds(source, sel) {
-        return String::new();
+        return std::ptr::null_mut();
     }
     // SAFETY: `id (id, SEL, NSTableView *, NSTableColumn *, NSInteger)`.
-    let object = unsafe {
+    unsafe {
         let f: unsafe extern "C" fn(Id, Sel, Id, Id, isize) -> Id =
             std::mem::transmute(objc::msg::entry());
         f(source, sel, receiver, column, row)
-    };
+    }
+}
+
+/// The value at `row` of `column`, as the text the cell would show.
+fn value(receiver: Id, column: Id, row: isize) -> String {
+    let object = object_value(receiver, column, row);
     if object.is_null() {
         return String::new();
     }
@@ -233,7 +354,7 @@ fn value(receiver: Id, column: Id, row: isize) -> String {
 }
 
 unsafe extern "C" fn reload_data(receiver: Id, _sel: Sel) {
-    crate::backing::needs_display(receiver);
+    reload(receiver);
 }
 
 unsafe extern "C" fn scroll_row_to_visible(receiver: Id, _sel: Sel, row: isize) {
@@ -280,41 +401,107 @@ fn index_set_members(set: Id) -> Vec<isize> {
 }
 
 unsafe extern "C" fn select_row_indexes(receiver: Id, _sel: Sel, set: Id, extend: u8) {
-    let rows = index_set_members(set);
-    update_table(receiver, |t| {
-        if extend == 0 {
-            t.selected.clear();
-        }
-        t.selected.extend(rows);
-        t.selected.sort_unstable();
-        t.selected.dedup();
-    });
+    let mut rows = index_set_members(set);
+    if extend != 0 {
+        rows.extend(table(receiver).selected);
+    }
+    change_selection(receiver, rows, Origin::Program);
 }
 
-unsafe extern "C" fn selected_row_indexes(receiver: Id, _sel: Sel) -> Id {
+/// What changed a table's selection, which decides who is told.
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    /// The user, or the program: the selection binding hears of it.
+    Program,
+    /// The selection binding, which needs no telling.
+    Binding,
+}
+
+/// Select `rows`, showing it in the row views, and tell the selection
+/// binding, the delegate and anyone listening if that changed anything.
+fn change_selection(receiver: Id, mut selected: Vec<isize>, origin: Origin) {
+    let count = rows(receiver);
+    selected.retain(|row| (0..count).contains(row));
+    selected.sort_unstable();
+    selected.dedup();
+    if table(receiver).selected == selected {
+        return;
+    }
+    let rows = selected;
+    update_table(receiver, |t| t.selected = rows.clone());
+    for (row, view) in table(receiver).row_views.iter().enumerate() {
+        let selected = rows.contains(&(row as isize));
+        // SAFETY: `void (id, SEL, BOOL)` on a row view.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+            f(*view as Id, objc::sel::get("setSelected:"), selected as u8);
+        }
+        refresh_background_styles(*view as Id);
+    }
+    let outline = crate::outline::is_outline(receiver);
+    if origin == Origin::Program {
+        let (name, value) = match outline {
+            true => (
+                "selectionIndexPaths",
+                crate::outline::paths_of_rows(receiver, &rows),
+            ),
+            false => ("selectionIndexes", index_set_of(&rows)),
+        };
+        crate::bindings::push(receiver, name, value);
+    }
+    let (name, selector) = match outline {
+        true => (
+            "NSOutlineViewSelectionDidChangeNotification",
+            "outlineViewSelectionDidChange:",
+        ),
+        false => (
+            "NSTableViewSelectionDidChangeNotification",
+            "tableViewSelectionDidChange:",
+        ),
+    };
+    // AppKit registers the delegate for this notification; nothing here
+    // keeps that registration, so the delegate is told directly.
+    let delegate = table(receiver).delegate as Id;
+    let changed = objc::sel::get(selector);
+    if responds(delegate, changed) {
+        let notification = foundation::notification::make(name, receiver, std::ptr::null_mut());
+        // SAFETY: `void (id, SEL, NSNotification *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            f(delegate, changed, notification);
+        }
+    }
+    foundation::notification::post(name, receiver, std::ptr::null_mut());
+}
+
+/// A new, autoreleased `NSIndexSet` of `rows`.
+fn index_set_of(rows: &[isize]) -> Id {
     let class = objc::class::lookup(c"NSMutableIndexSet").expect("declared by Foundation");
-    let index_set = objc::sel::get("indexSet");
-    let add = objc::sel::get("addIndex:");
     // SAFETY: `+indexSet` is `id (Class, SEL)`, `-addIndex:` is
     // `void (id, SEL, NSUInteger)`.
     unsafe {
         let make: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
-        let set = make(objc::class::ptr(class) as Id, index_set);
-        let add_index: unsafe extern "C" fn(Id, Sel, usize) =
-            std::mem::transmute(objc::msg::entry());
-        for row in table(receiver).selected {
-            add_index(set, add, row as usize);
+        let set = make(objc::class::ptr(class) as Id, objc::sel::get("indexSet"));
+        let add: unsafe extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc::msg::entry());
+        for row in rows {
+            add(set, objc::sel::get("addIndex:"), *row as usize);
         }
         set
     }
 }
 
+unsafe extern "C" fn selected_row_indexes(receiver: Id, _sel: Sel) -> Id {
+    index_set_of(&table(receiver).selected)
+}
+
 unsafe extern "C" fn deselect_all(receiver: Id, _sel: Sel, _sender: Id) {
-    update_table(receiver, |t| t.selected.clear());
+    change_selection(receiver, Vec::new(), Origin::Program);
 }
 
 unsafe extern "C" fn deselect_row(receiver: Id, _sel: Sel, row: isize) {
-    update_table(receiver, |t| t.selected.retain(|r| *r != row));
+    let mut rows = table(receiver).selected;
+    rows.retain(|r| *r != row);
+    change_selection(receiver, rows, Origin::Program);
 }
 
 unsafe extern "C" fn set_target(receiver: Id, _sel: Sel, target: Id) {
@@ -355,40 +542,43 @@ fn row_offset(receiver: Id, state: &Table, count: isize) -> f64 {
     scroll_offset(state.visible_row, pitch, count as f64 * pitch, visible)
 }
 
-/// Make `row` the one selected row, if the delegate agrees, and tell it.
+/// Make `row` the one selected row, if the delegate agrees.
 fn select_by_click(receiver: Id, row: isize) {
     let state = table(receiver);
     if state.selected == [row] {
         return;
     }
     let delegate = state.delegate as Id;
-    let should = objc::sel::get("tableView:shouldSelectRow:");
-    // SAFETY: `BOOL (id, SEL, NSTableView *, NSInteger)`, as the protocol
-    // declares.
-    if responds(delegate, should)
-        && unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, isize) -> u8 =
-                std::mem::transmute(objc::msg::entry());
-            f(delegate, should, receiver, row)
-        } == 0
-    {
-        return;
-    }
-    update_table(receiver, |t| t.selected = vec![row]);
-    // AppKit registers the delegate for this notification; nothing here
-    // keeps that registration, so the delegate is told directly.
-    const DID_CHANGE: &str = "NSTableViewSelectionDidChangeNotification";
-    let changed = objc::sel::get("tableViewSelectionDidChange:");
-    if responds(delegate, changed) {
-        let notification =
-            foundation::notification::make(DID_CHANGE, receiver, std::ptr::null_mut());
-        // SAFETY: `void (id, SEL, NSNotification *)`.
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
-            f(delegate, changed, notification);
+    // SAFETY: `BOOL (id, SEL, NSTableView *, NSInteger)` and
+    // `BOOL (id, SEL, NSOutlineView *, id)`, as the protocols declare.
+    let allowed = unsafe {
+        match crate::outline::is_outline(receiver) {
+            true => {
+                let should = objc::sel::get("outlineView:shouldSelectItem:");
+                !responds(delegate, should) || {
+                    let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> u8 =
+                        std::mem::transmute(objc::msg::entry());
+                    f(
+                        delegate,
+                        should,
+                        receiver,
+                        crate::outline::item_at(receiver, row),
+                    ) != 0
+                }
+            }
+            false => {
+                let should = objc::sel::get("tableView:shouldSelectRow:");
+                !responds(delegate, should) || {
+                    let f: unsafe extern "C" fn(Id, Sel, Id, isize) -> u8 =
+                        std::mem::transmute(objc::msg::entry());
+                    f(delegate, should, receiver, row) != 0
+                }
+            }
         }
+    };
+    if allowed {
+        change_selection(receiver, vec![row], Origin::Program);
     }
-    foundation::notification::post(DID_CHANGE, receiver, std::ptr::null_mut());
 }
 
 /// `-mouseDown:`: the row under the pointer is selected, and a double click
@@ -420,9 +610,10 @@ unsafe extern "C" fn mouse_down(receiver: Id, _sel: Sel, event: Id) {
     };
     let count = rows(receiver);
     let pitch = state.row_height + state.spacing_height;
-    let row = match pitch > 0.0 {
-        true => ((from_top + row_offset(receiver, &state, count)) / pitch).floor() as isize,
-        false => -1,
+    let row = match (state.row_tops.is_empty(), pitch > 0.0) {
+        (false, _) => row_at(&state, from_top),
+        (true, true) => ((from_top + row_offset(receiver, &state, count)) / pitch).floor() as isize,
+        (true, false) => -1,
     };
     let row = if (0..count).contains(&row) { row } else { -1 };
     let mut x = bounds.origin.x;
@@ -430,7 +621,7 @@ unsafe extern "C" fn mouse_down(receiver: Id, _sel: Sel, event: Id) {
         .columns
         .iter()
         .position(|c| {
-            x += column(*c as Id).width + 3.0;
+            x += column(*c as Id).width + state.spacing_width;
             point.x < x
         })
         .map_or(-1, |at| at as isize);
@@ -465,7 +656,21 @@ fn scroll_offset(row: Option<isize>, pitch: f64, total: f64, visible: f64) -> f6
     (bottom - visible).clamp(0.0, (total - visible).max(0.0))
 }
 
-unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
+unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, dirty: NSRect) {
+    if is_view_based(receiver) {
+        // The row views draw the rows; the table only its background, which
+        // a source list leaves to the sidebar material behind it.
+        let color = table(receiver).background as Id;
+        if !color.is_null() && highlight_style(receiver) != HIGHLIGHT_SOURCE_LIST {
+            // SAFETY: an `NSColor`, sent `-set`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                f(color, objc::sel::get("set"));
+            }
+            crate::color::NSRectFill(dirty);
+        }
+        return;
+    }
     let bounds = view::bounds_of(receiver);
     let density = crate::backing::focus_density();
     let width = (bounds.size.width * density).ceil() as usize;
@@ -716,6 +921,783 @@ unsafe extern "C" fn sort_descriptors(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
+// View-based tables.
+
+/// `NSTableViewSelectionHighlightStyle`.
+const HIGHLIGHT_SOURCE_LIST: isize = 1;
+
+fn highlight_style(receiver: Id) -> isize {
+    crate::props::integer(receiver, "selectionHighlightStyle") as isize
+}
+
+unsafe extern "C" fn set_selection_highlight_style(receiver: Id, _sel: Sel, style: isize) {
+    crate::props::set_integer_of(receiver, "selectionHighlightStyle", style as usize);
+    for row_view in table(receiver).row_views {
+        set_row_highlight_style(row_view as Id, style);
+    }
+    crate::backing::needs_display(receiver);
+}
+
+fn set_row_highlight_style(row_view: Id, style: isize) {
+    // SAFETY: `void (id, SEL, NSTableViewSelectionHighlightStyle)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, isize) = std::mem::transmute(objc::msg::entry());
+        f(row_view, objc::sel::get("setSelectionHighlightStyle:"), style);
+    }
+}
+
+fn send_id(receiver: Id, sel: &str) -> Id {
+    // SAFETY: `id (id, SEL)`, as each selector this is used with is.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel))
+    }
+}
+
+fn send_id_id(receiver: Id, sel: &str, argument: Id) -> Id {
+    // SAFETY: `id (id, SEL, id)`, as each selector this is used with is.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel), argument)
+    }
+}
+
+fn send_rect(receiver: Id, sel: &str, rect: NSRect) {
+    // SAFETY: `void (id, SEL, NSRect)`, as each selector this is used with is.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel), rect);
+    }
+}
+
+/// The nibs registered for cell views, by identifier: a dictionary the table
+/// owns.
+fn registered_nibs(receiver: Id) -> Id {
+    let found = crate::props::object(receiver, "registeredNibsByIdentifier");
+    if !found.is_null() {
+        return found;
+    }
+    let class = objc::class::lookup(c"NSMutableDictionary").expect("NSMutableDictionary");
+    let made = send_id(objc::class::ptr(class) as Id, "dictionary");
+    // SAFETY: the strong property setter.
+    unsafe {
+        crate::props::set_retained(
+            receiver,
+            objc::sel::get("setRegisteredNibsByIdentifier:"),
+            made,
+        )
+    };
+    made
+}
+
+unsafe extern "C" fn registered_nibs_by_identifier(receiver: Id, _sel: Sel) -> Id {
+    registered_nibs(receiver)
+}
+
+unsafe extern "C" fn register_nib(receiver: Id, _sel: Sel, nib: Id, identifier: Id) {
+    let nibs = registered_nibs(receiver);
+    match nib.is_null() {
+        true => send_id_id(nibs, "removeObjectForKey:", identifier),
+        // SAFETY: `void (id, SEL, id, id)`.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+            f(nibs, objc::sel::get("setObject:forKey:"), nib, identifier);
+            std::ptr::null_mut()
+        },
+    };
+}
+
+/// Whether the table is made of views: it has nibs for them, or its delegate
+/// makes them.
+fn is_view_based(receiver: Id) -> bool {
+    let nibs = crate::props::object(receiver, "registeredNibsByIdentifier");
+    let delegate = table(receiver).delegate as Id;
+    (!nibs.is_null() && crate::tree_controller::send_word(nibs, "count") != 0)
+        || responds(
+            delegate,
+            objc::sel::get(match crate::outline::is_outline(receiver) {
+                true => "outlineView:viewForTableColumn:item:",
+                false => "tableView:viewForTableColumn:row:",
+            }),
+        )
+}
+
+/// `-makeViewWithIdentifier:owner:`: a new view from the nib registered for
+/// `identifier`, wired to `owner`; nil when there is none.
+///
+/// FIXME (ACCURACY): every call instantiates the nib again; nothing is reused.
+unsafe extern "C" fn make_view(receiver: Id, _sel: Sel, identifier: Id, owner: Id) -> Id {
+    if identifier.is_null() {
+        return std::ptr::null_mut();
+    }
+    let nib = send_id_id(registered_nibs(receiver), "objectForKey:", identifier);
+    if nib.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(objects) = crate::nib::instantiate_nib(nib, owner) else {
+        return std::ptr::null_mut();
+    };
+    let views: Vec<Id> = objects
+        .into_iter()
+        .filter(|object| view::is_view(*object))
+        .collect();
+    let same = |view: Id| {
+        let own = send_id(view, "identifier");
+        // SAFETY: `BOOL (id, SEL, id)`.
+        !own.is_null()
+            && unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                f(own, objc::sel::get("isEqualToString:"), identifier) != 0
+            }
+    };
+    let Some(made) = views
+        .iter()
+        .copied()
+        .find(|view| same(*view))
+        .or(views.first().copied())
+    else {
+        return std::ptr::null_mut();
+    };
+    if !same(made) {
+        send_id_id(made, "setIdentifier:", identifier);
+    }
+    objc::arc::autorelease(objc::arc::retain(made))
+}
+
+/// How tall `row` is, its intercell spacing aside: the delegate's answer, or
+/// the row height.
+fn height_of_row(receiver: Id, state: &Table, row: isize) -> f64 {
+    let delegate = state.delegate as Id;
+    // SAFETY: `CGFloat (id, SEL, NSTableView *, NSInteger)` and
+    // `CGFloat (id, SEL, NSOutlineView *, id)`, as the protocols declare.
+    unsafe {
+        match crate::outline::is_outline(receiver) {
+            true if responds(delegate, objc::sel::get("outlineView:heightOfRowByItem:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> f64 =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("outlineView:heightOfRowByItem:"),
+                    receiver,
+                    crate::outline::item_at(receiver, row),
+                )
+            }
+            false if responds(delegate, objc::sel::get("tableView:heightOfRow:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, isize) -> f64 =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("tableView:heightOfRow:"),
+                    receiver,
+                    row,
+                )
+            }
+            _ => state.row_height,
+        }
+    }
+}
+
+/// The row whose span holds `from_top`, or -1.
+fn row_at(state: &Table, from_top: f64) -> isize {
+    state
+        .row_tops
+        .windows(2)
+        .position(|span| span[0] <= from_top && from_top < span[1])
+        .map_or(-1, |row| row as isize)
+}
+
+/// `-rectOfRow:`: the row across the whole table.
+unsafe extern "C" fn rect_of_row(receiver: Id, _sel: Sel, row: isize) -> NSRect {
+    let state = table(receiver);
+    let width = view::bounds_of(receiver).size.width;
+    let span = match state.row_tops.is_empty() {
+        true => {
+            let pitch = state.row_height + state.spacing_height;
+            (row >= 0 && row < rows(receiver)).then(|| (row as f64 * pitch, pitch))
+        }
+        false => usize::try_from(row)
+            .ok()
+            .and_then(|row| Some((*state.row_tops.get(row)?, *state.row_tops.get(row + 1)?)))
+            .map(|(top, bottom)| (top, bottom - top)),
+    };
+    span.map_or(NSRect::default(), |(top, height)| NSRect {
+        origin: NSPoint { x: 0.0, y: top },
+        size: foundation::geometry::NSSize { width, height },
+    })
+}
+
+/// `-rectOfColumn:`: the column down the whole table, its spacing included.
+unsafe extern "C" fn rect_of_column(receiver: Id, _sel: Sel, index: isize) -> NSRect {
+    let state = table(receiver);
+    let Some(columns) = usize::try_from(index)
+        .ok()
+        .and_then(|index| state.columns.get(..=index))
+    else {
+        return NSRect::default();
+    };
+    let widths: Vec<f64> = columns
+        .iter()
+        .map(|c| column(*c as Id).width + state.spacing_width)
+        .collect();
+    let (last, before) = widths.split_last().expect("one column at least");
+    NSRect {
+        origin: NSPoint {
+            x: before.iter().sum(),
+            y: 0.0,
+        },
+        size: foundation::geometry::NSSize {
+            width: *last,
+            height: view::bounds_of(receiver).size.height,
+        },
+    }
+}
+
+/// `-frameOfCellAtColumn:row:`: where the row and column meet, inside the
+/// intercell spacing, and past an outline's indentation.
+unsafe extern "C" fn frame_of_cell(receiver: Id, sel: Sel, index: isize, row: isize) -> NSRect {
+    // SAFETY: the same receiver.
+    let (row_rect, column_rect) = unsafe {
+        (
+            rect_of_row(receiver, sel, row),
+            rect_of_column(receiver, sel, index),
+        )
+    };
+    let state = table(receiver);
+    let indent = crate::outline::indentation_at(receiver, column_at(receiver, index as usize), row);
+    let x = column_rect.origin.x + state.spacing_width / 2.0 + indent;
+    NSRect {
+        origin: NSPoint {
+            x,
+            y: row_rect.origin.y + state.spacing_height / 2.0,
+        },
+        size: foundation::geometry::NSSize {
+            width: (column_rect.size.width - state.spacing_width - indent).max(0.0),
+            height: (row_rect.size.height - state.spacing_height).max(0.0),
+        },
+    }
+}
+
+/// `-rowAtPoint:`.
+unsafe extern "C" fn row_at_point(receiver: Id, _sel: Sel, point: NSPoint) -> isize {
+    let state = table(receiver);
+    if state.row_tops.is_empty() {
+        let pitch = state.row_height + state.spacing_height;
+        let row = (point.y / pitch).floor() as isize;
+        return if pitch > 0.0 && (0..rows(receiver)).contains(&row) {
+            row
+        } else {
+            -1
+        };
+    }
+    row_at(&state, point.y)
+}
+
+/// Whether the delegate shows `row` as a group row.
+fn is_group_row(receiver: Id, row: isize) -> bool {
+    let delegate = table(receiver).delegate as Id;
+    // SAFETY: `BOOL (id, SEL, NSTableView *, NSInteger)` and
+    // `BOOL (id, SEL, NSOutlineView *, id)`.
+    unsafe {
+        match crate::outline::is_outline(receiver) {
+            true if responds(delegate, objc::sel::get("outlineView:isGroupItem:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("outlineView:isGroupItem:"),
+                    receiver,
+                    crate::outline::item_at(receiver, row),
+                ) != 0
+            }
+            false if responds(delegate, objc::sel::get("tableView:isGroupRow:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, isize) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("tableView:isGroupRow:"),
+                    receiver,
+                    row,
+                ) != 0
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The delegate's row view for `row`, or a plain one.
+fn make_row_view(receiver: Id, row: isize, frame: NSRect) -> Id {
+    let delegate = table(receiver).delegate as Id;
+    // SAFETY: `id (id, SEL, NSTableView *, NSInteger)` and
+    // `id (id, SEL, NSOutlineView *, id)`.
+    let given = unsafe {
+        match crate::outline::is_outline(receiver) {
+            true if responds(delegate, objc::sel::get("outlineView:rowViewForItem:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("outlineView:rowViewForItem:"),
+                    receiver,
+                    crate::outline::item_at(receiver, row),
+                )
+            }
+            false if responds(delegate, objc::sel::get("tableView:rowViewForRow:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, isize) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("tableView:rowViewForRow:"),
+                    receiver,
+                    row,
+                )
+            }
+            _ => std::ptr::null_mut(),
+        }
+    };
+    if !given.is_null() {
+        send_rect(given, "setFrame:", frame);
+        return objc::arc::retain(given);
+    }
+    let class = objc::class::lookup(c"NSTableRowView").expect("declared in crate::classes");
+    let made = send_id(objc::class::ptr(class) as Id, "alloc");
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id = std::mem::transmute(objc::msg::entry());
+        f(made, objc::sel::get("initWithFrame:"), frame)
+    }
+}
+
+/// The delegate's view for `column` of `row` - `column` nil for a group row -
+/// or one from the nib registered for the column's identifier.
+fn make_cell_view(receiver: Id, column: Id, row: isize) -> Id {
+    let delegate = table(receiver).delegate as Id;
+    // SAFETY: `id (id, SEL, NSTableView *, NSTableColumn *, NSInteger)` and
+    // `id (id, SEL, NSOutlineView *, NSTableColumn *, id)`.
+    unsafe {
+        match crate::outline::is_outline(receiver) {
+            true if responds(delegate, objc::sel::get("outlineView:viewForTableColumn:item:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("outlineView:viewForTableColumn:item:"),
+                    receiver,
+                    column,
+                    crate::outline::item_at(receiver, row),
+                )
+            }
+            false if responds(delegate, objc::sel::get("tableView:viewForTableColumn:row:")) => {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id, isize) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("tableView:viewForTableColumn:row:"),
+                    receiver,
+                    column,
+                    row,
+                )
+            }
+            _ if column.is_null() => std::ptr::null_mut(),
+            _ => make_view(
+                receiver,
+                objc::sel::get("makeViewWithIdentifier:owner:"),
+                column_identifier(column, objc::sel::get("identifier")),
+                delegate,
+            ),
+        }
+    }
+}
+
+/// Tell the cell views of a row view what their row is drawn on.
+fn refresh_background_styles(row_view: Id) {
+    // SAFETY: `NSBackgroundStyle (id, SEL)` on a row view.
+    let style = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> isize = std::mem::transmute(objc::msg::entry());
+        f(row_view, objc::sel::get("interiorBackgroundStyle"))
+    };
+    for cell in view::subviews_of(row_view) {
+        if responds(cell, objc::sel::get("setBackgroundStyle:")) {
+            // SAFETY: `void (id, SEL, NSBackgroundStyle)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, isize) =
+                    std::mem::transmute(objc::msg::entry());
+                f(cell, objc::sel::get("setBackgroundStyle:"), style);
+            }
+        }
+    }
+}
+
+/// Tell the delegate a row view was added to the table, or removed from it.
+fn tell_row_view(receiver: Id, row_view: Id, row: isize, added: bool) {
+    let delegate = table(receiver).delegate as Id;
+    let selector = match (crate::outline::is_outline(receiver), added) {
+        (true, true) => "outlineView:didAddRowView:forRow:",
+        (true, false) => "outlineView:didRemoveRowView:forRow:",
+        (false, true) => "tableView:didAddRowView:forRow:",
+        (false, false) => "tableView:didRemoveRowView:forRow:",
+    };
+    let sel = objc::sel::get(selector);
+    if responds(delegate, sel) {
+        // SAFETY: `void (id, SEL, NSTableView *, NSTableRowView *, NSInteger)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, isize) =
+                std::mem::transmute(objc::msg::entry());
+            f(delegate, sel, receiver, row_view, row);
+        }
+    }
+}
+
+/// The last column, the first or all of them, by the autoresizing style,
+/// grown or shrunk so the columns fill the table's width.
+fn fit_columns(receiver: Id, width: f64) {
+    /// `NSTableViewColumnAutoresizingStyle`.
+    const NONE: isize = 0;
+    const UNIFORM: isize = 1;
+    const FIRST_COLUMN_ONLY: isize = 5;
+    let state = table(receiver);
+    if state.autoresizing_style == NONE || state.columns.is_empty() {
+        return;
+    }
+    let used: f64 = state
+        .columns
+        .iter()
+        .map(|c| column(*c as Id).width + state.spacing_width)
+        .sum();
+    let spare = width - used;
+    // FIXME (ACCURACY): the sequential styles give all the change to the last
+    // column, and no column's minimum or maximum width is kept.
+    let changed: Vec<(usize, f64)> = match state.autoresizing_style {
+        UNIFORM => {
+            let share = spare / state.columns.len() as f64;
+            state.columns.iter().map(|c| (*c, share)).collect()
+        }
+        FIRST_COLUMN_ONLY => vec![(state.columns[0], spare)],
+        _ => vec![(*state.columns.last().expect("not empty"), spare)],
+    };
+    for (c, change) in changed {
+        update_column(c as Id, |c| c.width = (c.width + change).max(0.0));
+    }
+}
+
+thread_local! {
+    /// Tables making their rows now, and whether each was asked to again.
+    static TILING: std::cell::RefCell<HashMap<usize, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Make a view-based table's row and cell views again, and size the table to
+/// its rows. A request made while it is doing so - a delegate reloading from
+/// a callback - does it again once it is done.
+fn tile(receiver: Id) {
+    let busy = TILING.with(|t| match t.borrow_mut().entry(receiver as usize) {
+        std::collections::hash_map::Entry::Occupied(mut again) => {
+            again.insert(true);
+            true
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(false);
+            false
+        }
+    });
+    if busy {
+        return;
+    }
+    const PASSES: usize = 4;
+    for _ in 0..PASSES {
+        make_rows(receiver);
+        let again = TILING.with(|t| {
+            std::mem::replace(
+                t.borrow_mut()
+                    .get_mut(&(receiver as usize))
+                    .expect("inserted above"),
+                false,
+            )
+        });
+        if !again {
+            break;
+        }
+    }
+    TILING.with(|t| t.borrow_mut().remove(&(receiver as usize)));
+}
+
+fn make_rows(receiver: Id) {
+    let count = rows(receiver);
+    let state = table(receiver);
+    let mut tops = Vec::with_capacity(count.max(0) as usize + 1);
+    let mut bottom = 0.0;
+    for row in 0..count {
+        tops.push(bottom);
+        bottom += height_of_row(receiver, &state, row) + state.spacing_height;
+    }
+    tops.push(bottom);
+    update_table(receiver, |t| t.row_tops = tops);
+
+    // A document view at least fills the clip view it is in.
+    // SAFETY: a view of this crate's.
+    let clip = unsafe { view::superview_of(receiver) };
+    let frame = view::frame_of(receiver);
+    let (width, height) = match objc::class::lookup(c"NSClipView") {
+        // SAFETY: a live view.
+        Some(class)
+            if view::is_view(clip) && unsafe { corefoundation::base::is_kind_of(clip.cast(), class) } =>
+        {
+            let visible = view::bounds_of(clip).size;
+            (visible.width, bottom.max(visible.height))
+        }
+        _ => (frame.size.width, bottom),
+    };
+    if (width, height) != (frame.size.width, frame.size.height) {
+        // SAFETY: `void (id, SEL, NSSize)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, foundation::geometry::NSSize) =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                receiver,
+                objc::sel::get("setFrameSize:"),
+                foundation::geometry::NSSize { width, height },
+            );
+        }
+    }
+    fit_columns(receiver, width);
+
+    let old = std::mem::take(&mut tables()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(receiver as usize)
+        .or_default()
+        .row_views);
+    for (row, row_view) in old.into_iter().enumerate() {
+        let row_view = row_view as Id;
+        send_id(row_view, "removeFromSuperview");
+        tell_row_view(receiver, row_view, row as isize, false);
+        objc::arc::release(row_view);
+    }
+
+    let gives_values = has_object_values(receiver);
+    let columns = table(receiver).columns;
+    let mut made = Vec::with_capacity(count.max(0) as usize);
+    for row in 0..count {
+        // SAFETY: the same receiver.
+        let rect = unsafe { rect_of_row(receiver, std::ptr::null(), row) };
+        let row_view = make_row_view(receiver, row, rect);
+        let group = is_group_row(receiver, row);
+        // SAFETY: `void (id, SEL, BOOL)` on a row view.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+            f(row_view, objc::sel::get("setGroupRowStyle:"), group as u8);
+            f(
+                row_view,
+                objc::sel::get("setSelected:"),
+                table(receiver).selected.contains(&row) as u8,
+            );
+            f(row_view, objc::sel::get("setEmphasized:"), 1);
+        }
+        set_row_highlight_style(row_view, highlight_style(receiver));
+        let cells: Vec<(Id, NSRect)> = match group {
+            true => vec![(std::ptr::null_mut(), rect)],
+            false => columns
+                .iter()
+                .enumerate()
+                .map(|(index, c)| {
+                    // SAFETY: `NSRect (id, SEL, NSInteger, NSInteger)`, sent
+                    // so a subclass's placement is used.
+                    let frame = unsafe {
+                        let f: unsafe extern "C" fn(Id, Sel, isize, isize) -> NSRect =
+                            std::mem::transmute(objc::msg::entry());
+                        f(
+                            receiver,
+                            objc::sel::get("frameOfCellAtColumn:row:"),
+                            index as isize,
+                            row,
+                        )
+                    };
+                    (*c as Id, frame)
+                })
+                .collect(),
+        };
+        for (column, frame) in cells {
+            let cell = make_cell_view(receiver, column, row);
+            if cell.is_null() {
+                continue;
+            }
+            if gives_values && responds(cell, objc::sel::get("setObjectValue:")) {
+                send_id_id(cell, "setObjectValue:", object_value(receiver, column, row));
+            }
+            send_rect(
+                cell,
+                "setFrame:",
+                NSRect {
+                    origin: NSPoint {
+                        x: frame.origin.x - rect.origin.x,
+                        y: frame.origin.y - rect.origin.y,
+                    },
+                    size: frame.size,
+                },
+            );
+            send_id_id(row_view, "addSubview:", cell);
+        }
+        refresh_background_styles(row_view);
+        send_id_id(receiver, "addSubview:", row_view);
+        made.push(row_view as usize);
+        update_table(receiver, |t| t.row_views = made.clone());
+        tell_row_view(receiver, row_view, row, true);
+    }
+}
+
+unsafe extern "C" fn row_view_at_row(receiver: Id, _sel: Sel, row: isize, _make: u8) -> Id {
+    usize::try_from(row)
+        .ok()
+        .and_then(|row| table(receiver).row_views.get(row).copied())
+        .unwrap_or(0) as Id
+}
+
+/// `-viewAtColumn:row:makeIfNecessary:`: the row's view for that column, the
+/// row's only view for a group row.
+unsafe extern "C" fn view_at(receiver: Id, sel: Sel, index: isize, row: isize, make: u8) -> Id {
+    // SAFETY: the same receiver.
+    let row_view = unsafe { row_view_at_row(receiver, sel, row, make) };
+    if row_view.is_null() {
+        return row_view;
+    }
+    let cells = view::subviews_of(row_view);
+    let index = match is_group_row(receiver, row) {
+        true => 0,
+        false => index.max(0) as usize,
+    };
+    cells.get(index).copied().unwrap_or(std::ptr::null_mut())
+}
+
+/// The row view `view` is in, and its row.
+fn enclosing_row(receiver: Id, view: Id) -> Option<(usize, Id)> {
+    let row_views = table(receiver).row_views;
+    let mut at = view;
+    while view::is_view(at) {
+        if let Some(row) = row_views.iter().position(|r| *r == at as usize) {
+            return Some((row, at));
+        }
+        // SAFETY: a view of this crate's.
+        at = unsafe { view::superview_of(at) };
+    }
+    None
+}
+
+unsafe extern "C" fn row_for_view(receiver: Id, _sel: Sel, view: Id) -> isize {
+    enclosing_row(receiver, view).map_or(-1, |(row, _)| row as isize)
+}
+
+unsafe extern "C" fn column_for_view(receiver: Id, _sel: Sel, view: Id) -> isize {
+    let Some((row, row_view)) = enclosing_row(receiver, view) else {
+        return -1;
+    };
+    if is_group_row(receiver, row as isize) {
+        return -1;
+    }
+    let cells = view::subviews_of(row_view);
+    let mut at = view;
+    while view::is_view(at) && at != row_view {
+        if let Some(index) = cells.iter().position(|c| *c == at) {
+            return index as isize;
+        }
+        // SAFETY: a view of this crate's.
+        at = unsafe { view::superview_of(at) };
+    }
+    -1
+}
+
+unsafe extern "C" fn column_with_identifier(receiver: Id, _sel: Sel, identifier: Id) -> isize {
+    table(receiver)
+        .columns
+        .iter()
+        .position(|c| {
+            let own = column(*c as Id).identifier as Id;
+            // SAFETY: `BOOL (id, SEL, id)` on a string.
+            !own.is_null()
+                && unsafe {
+                    let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                        std::mem::transmute(objc::msg::entry());
+                    f(own, objc::sel::get("isEqual:"), identifier) != 0
+                }
+        })
+        .map_or(-1, |index| index as isize)
+}
+
+unsafe extern "C" fn table_column_with_identifier(receiver: Id, sel: Sel, identifier: Id) -> Id {
+    // SAFETY: the same receiver.
+    let index = unsafe { column_with_identifier(receiver, sel, identifier) };
+    match usize::try_from(index) {
+        Ok(index) => column_at(receiver, index),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn intercell_spacing(receiver: Id, _sel: Sel) -> foundation::geometry::NSSize {
+    let state = table(receiver);
+    foundation::geometry::NSSize {
+        width: state.spacing_width,
+        height: state.spacing_height,
+    }
+}
+
+unsafe extern "C" fn set_intercell_spacing(
+    receiver: Id,
+    _sel: Sel,
+    spacing: foundation::geometry::NSSize,
+) {
+    update_table(receiver, |t| {
+        t.spacing_width = spacing.width;
+        t.spacing_height = spacing.height;
+    });
+    rows_changed(receiver);
+}
+
+unsafe extern "C" fn column_autoresizing_style(receiver: Id, _sel: Sel) -> isize {
+    table(receiver).autoresizing_style
+}
+
+unsafe extern "C" fn set_column_autoresizing_style(receiver: Id, _sel: Sel, style: isize) {
+    update_table(receiver, |t| t.autoresizing_style = style);
+}
+
+unsafe extern "C" fn yes(_receiver: Id, _sel: Sel) -> u8 {
+    1
+}
+
+/// NSView's own implementation of `sel`, for an override to run first.
+fn view_implementation(sel: &str) -> objc::class::Imp {
+    objc::class::lookup(c"NSView")
+        .and_then(|c| c.method(objc::sel::get(sel)))
+        .expect("NSView's geometry methods are installed first")
+        .implementation()
+}
+
+/// A change of width lays a view-based table's rows out again.
+unsafe extern "C" fn set_frame_size(receiver: Id, sel: Sel, size: foundation::geometry::NSSize) {
+    let before = view::bounds_of(receiver).size.width;
+    // SAFETY: NSView's `-setFrameSize:`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, foundation::geometry::NSSize) =
+            std::mem::transmute(view_implementation("setFrameSize:"));
+        f(receiver, sel, size);
+    }
+    if view::bounds_of(receiver).size.width != before && is_view_based(receiver) {
+        tile(receiver);
+    }
+}
+
+unsafe extern "C" fn set_frame(receiver: Id, sel: Sel, frame: NSRect) {
+    let before = view::bounds_of(receiver).size.width;
+    // SAFETY: NSView's `-setFrame:`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) =
+            std::mem::transmute(view_implementation("setFrame:"));
+        f(receiver, sel, frame);
+    }
+    if view::bounds_of(receiver).size.width != before && is_view_based(receiver) {
+        tile(receiver);
+    }
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSTableHeaderView").expect("declared in crate::classes");
     methods!(class, {
@@ -760,6 +1742,28 @@ pub(crate) fn install() {
         // data source is not told the descriptors changed.
         "sortDescriptors" => sort_descriptors, c"@16@0:8";
         "setSortDescriptors:" => crate::props::set_copied, c"v24@0:8@16";
+        "isFlipped" => yes, c"c16@0:8";
+        "selectionHighlightStyle" => crate::props::get_integer, c"q16@0:8";
+        "setSelectionHighlightStyle:" => set_selection_highlight_style, c"v24@0:8q16";
+        "registerNib:forIdentifier:" => register_nib, c"v32@0:8@16@24";
+        "registeredNibsByIdentifier" => registered_nibs_by_identifier, c"@16@0:8";
+        "makeViewWithIdentifier:owner:" => make_view, c"@32@0:8@16@24";
+        "rectOfRow:" => rect_of_row, c"{CGRect={CGPoint=dd}{CGSize=dd}}24@0:8q16";
+        "rectOfColumn:" => rect_of_column, c"{CGRect={CGPoint=dd}{CGSize=dd}}24@0:8q16";
+        "frameOfCellAtColumn:row:" => frame_of_cell, c"{CGRect={CGPoint=dd}{CGSize=dd}}32@0:8q16q24";
+        "rowAtPoint:" => row_at_point, c"q32@0:8{CGPoint=dd}16";
+        "rowViewAtRow:makeIfNecessary:" => row_view_at_row, c"@28@0:8q16c24";
+        "viewAtColumn:row:makeIfNecessary:" => view_at, c"@36@0:8q16q24c32";
+        "rowForView:" => row_for_view, c"q24@0:8@16";
+        "columnForView:" => column_for_view, c"q24@0:8@16";
+        "columnWithIdentifier:" => column_with_identifier, c"q24@0:8@16";
+        "tableColumnWithIdentifier:" => table_column_with_identifier, c"@24@0:8@16";
+        "intercellSpacing" => intercell_spacing, c"{CGSize=dd}16@0:8";
+        "setIntercellSpacing:" => set_intercell_spacing, c"v32@0:8{CGSize=dd}16";
+        "columnAutoresizingStyle" => column_autoresizing_style, c"q16@0:8";
+        "setColumnAutoresizingStyle:" => set_column_autoresizing_style, c"v24@0:8q16";
+        "setFrameSize:" => set_frame_size, c"v32@0:8{CGSize=dd}16";
+        "setFrame:" => set_frame, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
     });
     let column_class = objc::class::lookup(c"NSTableColumn").expect("declared in crate::classes");
     methods!(column_class, {
