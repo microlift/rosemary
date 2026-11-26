@@ -69,6 +69,12 @@ unsafe extern "C" fn system_time_zone(_class: Id, _sel: Sel) -> Id {
     unsafe { corefoundation::api::CFAutorelease(zone) as Id }
 }
 
+/// `+[NSTimeZone resetSystemTimeZone]`.
+unsafe extern "C" fn reset_system_time_zone(_class: Id, _sel: Sel) {
+    // SAFETY: takes nothing and touches only the zone cache.
+    unsafe { corefoundation::timezone::reset_system() };
+}
+
 unsafe extern "C" fn known_time_zone_names(_class: Id, _sel: Sel) -> Id {
     let names = known_names()
         .iter()
@@ -258,6 +264,7 @@ pub(crate) fn install() {
         "systemTimeZone" => system_time_zone, c"@16@0:8";
         "localTimeZone" => system_time_zone, c"@16@0:8";
         "defaultTimeZone" => system_time_zone, c"@16@0:8";
+        "resetSystemTimeZone" => reset_system_time_zone, c"v16@0:8";
         "knownTimeZoneNames" => known_time_zone_names, c"@16@0:8";
         "timeZoneWithName:" => time_zone_with_name, c"@24@0:8@16";
         "timeZoneWithAbbreviation:" => time_zone_with_abbreviation, c"@24@0:8@16";
@@ -340,6 +347,25 @@ mod tests {
             unsafe { crate::string::bytes(named) },
             corefoundation::timezone::system_name().as_bytes()
         );
+    }
+
+    /// Resetting drops only cached data: the system zone is still the host's,
+    /// and a zone object made before the reset still answers.
+    #[test]
+    fn resetting_the_system_zone_keeps_it_the_hosts() {
+        crate::bootstrap();
+        let sel = objc::sel::get("");
+        // SAFETY: `+systemTimeZone` and `+resetSystemTimeZone` take no arguments.
+        unsafe {
+            let before = system_time_zone(std::ptr::null_mut(), sel);
+            reset_system_time_zone(std::ptr::null_mut(), sel);
+            let after = system_time_zone(std::ptr::null_mut(), sel);
+            assert_eq!(
+                crate::string::bytes(name(after, sel)),
+                corefoundation::timezone::system_name().as_bytes()
+            );
+            assert_eq!(seconds_from_gmt(before, sel), seconds_from_gmt(after, sel));
+        }
     }
 
     /// A zone is found by the name it reports, and a name the host has never

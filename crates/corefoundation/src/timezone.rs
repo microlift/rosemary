@@ -65,6 +65,11 @@ pub fn database() -> Option<std::path::PathBuf> {
         .find(|dir| dir.is_dir())
 }
 
+type ZoneCache = std::collections::HashMap<String, Option<std::sync::Arc<crate::tzif::Zone>>>;
+
+/// Zones read so far, by name, including names the host turned out not to have.
+static ZONES: std::sync::Mutex<Option<ZoneCache>> = std::sync::Mutex::new(None);
+
 /// The zone called `name`, read from the host's database once and kept, or
 /// `None` for a name the host does not have.
 ///
@@ -72,10 +77,6 @@ pub fn database() -> Option<std::path::PathBuf> {
 /// zone lives even when its name is not in a database this can find; UTC and
 /// GMT are answered without one.
 pub fn zone(name: &str) -> Option<std::sync::Arc<crate::tzif::Zone>> {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    static ZONES: Mutex<Option<HashMap<String, Option<Arc<crate::tzif::Zone>>>>> = Mutex::new(None);
-
     let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
     let zones = zones.get_or_insert_default();
     if let Some(found) = zones.get(name) {
@@ -104,7 +105,7 @@ pub fn zone(name: &str) -> Option<std::sync::Arc<crate::tzif::Zone>> {
             "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" => Some(crate::tzif::Zone::fixed(0, name)),
             _ => offset_of_fixed_name(name).map(|offset| crate::tzif::Zone::fixed(offset, name)),
         })
-        .map(Arc::new);
+        .map(std::sync::Arc::new);
     zones.insert(name.to_owned(), found.clone());
     found
 }
@@ -180,6 +181,19 @@ pub unsafe extern "C" fn copy_default() -> CFTypeRef {
 
 pub unsafe extern "C" fn copy_system() -> CFTypeRef {
     new(&system_name())
+}
+
+/// `void CFTimeZoneResetSystem(void)`: forget what was read for the host's zone,
+/// so the next lookup sees a change to `/etc/localtime` or its contents.
+///
+/// The system name itself is never cached; what can go stale is the zone data
+/// kept under it, which for a name outside the database came from
+/// `/etc/localtime`.
+pub unsafe extern "C" fn reset_system() {
+    let mut zones = ZONES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(zones) = zones.as_mut() {
+        zones.remove(&system_name());
+    }
 }
 
 /// CFTimeZone's default abbreviation dictionary, which is what
