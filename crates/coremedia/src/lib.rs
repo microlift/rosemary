@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
-mod block_buffer;
+mod attachment;
+pub mod block_buffer;
 pub mod format_description;
 mod h264;
 pub mod sample_buffer;
@@ -30,6 +31,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 
 exports::exports! {
     groups {
+        attachment,
         format_description,
         block_buffer,
         sample_buffer,
