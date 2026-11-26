@@ -432,6 +432,81 @@ fn prepare(object: Id, key: &[u8]) {
 }
 
 /// The key paths `key` on `object` depends on, from its class's
+/// The elements of `array` at the indexes `indexes` holds.
+fn elements_at(array: Id, indexes: Id) -> Vec<Id> {
+    // SAFETY: an array, by the caller of the `NSArray` method.
+    let elements = unsafe { crate::elements_of(array) }.unwrap_or_default();
+    crate::indexset::ranges_of(indexes)
+        .into_iter()
+        .flat_map(|(start, end)| start..end)
+        .map(|index| match elements.get(index) {
+            Some(element) => *element as Id,
+            None => objc::fail!(
+                "NSArray: an observer at index {index}, beyond its {} elements",
+                elements.len()
+            ),
+        })
+        .collect()
+}
+
+/// `-[NSArray addObserver:toObjectsAtIndexes:forKeyPath:options:context:]`:
+/// the observation, registered with each of those elements.
+unsafe extern "C" fn add_observer_to_objects(
+    receiver: Id,
+    _sel: Sel,
+    observer: Id,
+    indexes: Id,
+    key_path: Id,
+    options: usize,
+    context: usize,
+) {
+    let sel = objc::sel::get("addObserver:forKeyPath:options:context:");
+    for element in elements_at(receiver, indexes) {
+        // SAFETY: `NSObject`'s own method, sent so an override runs.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, usize, usize) =
+                std::mem::transmute(objc::msg::entry());
+            f(element, sel, observer, key_path, options, context);
+        }
+    }
+}
+
+unsafe extern "C" fn remove_observer_from_objects(
+    receiver: Id,
+    _sel: Sel,
+    observer: Id,
+    indexes: Id,
+    key_path: Id,
+) {
+    let sel = objc::sel::get("removeObserver:forKeyPath:");
+    for element in elements_at(receiver, indexes) {
+        // SAFETY: as above.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+            f(element, sel, observer, key_path);
+        }
+    }
+}
+
+unsafe extern "C" fn remove_observer_from_objects_with_context(
+    receiver: Id,
+    _sel: Sel,
+    observer: Id,
+    indexes: Id,
+    key_path: Id,
+    context: usize,
+) {
+    let sel = objc::sel::get("removeObserver:forKeyPath:context:");
+    for element in elements_at(receiver, indexes) {
+        // SAFETY: as above.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, usize) =
+                std::mem::transmute(objc::msg::entry());
+            f(element, sel, observer, key_path, context);
+        }
+    }
+}
+
 /// `+keyPathsForValuesAffectingValueForKey:`.
 fn affecting(object: Id, key: &[u8]) -> Vec<Vec<u8>> {
     // SAFETY: a live object.
@@ -880,6 +955,15 @@ pub(crate) fn install() {
         "didChangeValueForKey:withSetMutation:usingObjects:" => did_change_set,
         c"v40@0:8@16Q24@32";
     });
+    let array = objc::class::lookup(c"NSArray").expect("CoreFoundation registered NSArray");
+    methods!(array, {
+        "addObserver:toObjectsAtIndexes:forKeyPath:options:context:" => add_observer_to_objects,
+        c"v56@0:8@16@24@32Q40^v48";
+        "removeObserver:fromObjectsAtIndexes:forKeyPath:" => remove_observer_from_objects,
+        c"v40@0:8@16@24@32";
+        "removeObserver:fromObjectsAtIndexes:forKeyPath:context:" =>
+        remove_observer_from_objects_with_context, c"v48@0:8@16@24@32^v40";
+    });
     class_methods!(nsobject, {
         "automaticallyNotifiesObserversForKey:" => automatically_notifies, c"c24@0:8@16";
         "keyPathsForValuesAffectingValueForKey:" => key_paths_affecting, c"@24@0:8@16";
@@ -1088,6 +1172,36 @@ mod tests {
         // SAFETY: a live object.
         let isa = unsafe { objc::object::class_of(subject) }.expect("an object");
         assert_eq!(isa.name_str(), "NSKVONotifying_RosemaryKvoPerson");
+    }
+
+    /// An array registers the observation with the elements it names only.
+    #[test]
+    fn an_array_observes_the_elements_at_its_indexes() {
+        let (first, second) = (person(), person());
+        let watcher = observer();
+        let array = corefoundation::collections::new_array(
+            &[first as _, second as _],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        ) as Id;
+        let indexes = crate::indexset::from_indexes(&[1]);
+        let path = Text::new(b"age");
+        // SAFETY: an array, a live observer, an index set and a key path.
+        unsafe {
+            add_observer_to_objects(
+                array,
+                objc::sel::get("addObserver:toObjectsAtIndexes:forKeyPath:options:context:"),
+                watcher,
+                indexes,
+                path.0,
+                options::NEW,
+                0,
+            )
+        };
+        set(first, "setAge:", 5);
+        set(second, "setAge:", 6);
+        assert_eq!(seen(watcher), ["age 6 -"]);
+        objc::arc::release(array);
     }
 
     /// A setter that answers a `BOOL` still answers it once wrapped.
