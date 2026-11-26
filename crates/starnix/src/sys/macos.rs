@@ -626,6 +626,11 @@ pub fn fd_target(fd: RawFd) -> Option<PathBuf> {
     fd_path(fd)
 }
 
+pub fn folds_case(directory: &CStr) -> bool {
+    // SAFETY: a NUL-terminated path; `pathconf` reads nothing else.
+    unsafe { libc::pathconf(directory.as_ptr(), libc::_PC_CASE_SENSITIVE) == 0 }
+}
+
 pub fn errno_location() -> *mut libc::c_int {
     // SAFETY: takes no argument and returns this thread's own slot.
     unsafe { libc::__error() }

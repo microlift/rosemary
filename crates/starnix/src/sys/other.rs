@@ -147,6 +147,10 @@ pub fn fd_target(fd: RawFd) -> Option<PathBuf> {
     fd_path(fd)
 }
 
+pub fn folds_case(_directory: &std::ffi::CStr) -> bool {
+    false
+}
+
 pub fn errno_location() -> *mut libc::c_int {
     // SAFETY: takes no argument and returns this thread's own slot.
     unsafe { libc::__error() }

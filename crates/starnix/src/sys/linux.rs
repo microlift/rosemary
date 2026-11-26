@@ -519,6 +519,12 @@ pub fn fd_target(fd: RawFd) -> Option<PathBuf> {
     std::fs::read_link(fd_path(fd)?).ok()
 }
 
+// Case-folding directories (ext4 and f2fs `casefold`) are opted into one
+// by one and not detected here.
+pub fn folds_case(_directory: &std::ffi::CStr) -> bool {
+    false
+}
+
 pub fn errno_location() -> *mut libc::c_int {
     // SAFETY: takes no argument and returns this thread's own slot.
     unsafe { libc::__errno_location() }

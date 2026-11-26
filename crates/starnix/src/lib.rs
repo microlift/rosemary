@@ -24,6 +24,7 @@
 
 pub mod errno;
 pub mod fd;
+pub mod fs;
 pub mod memory;
 pub mod net;
 pub mod ordering;
