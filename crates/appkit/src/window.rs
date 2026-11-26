@@ -2513,6 +2513,11 @@ fn order_front(receiver: Id, make_key: bool) {
     let window = window_of(receiver);
     let sdl = window.sdl;
     apply_style(receiver);
+    // Before it is shown, because a compositor decides whether to float a
+    // toplevel when it maps it.
+    if want == Presentation::Toplevel {
+        sdl3::video::set_window_transient_for(sdl, dialog_owner(receiver));
+    }
     // Told again here: a window remade above has a new SDL window.
     tell_desktop_level(window);
     // The frame again, now that the window is the kind it is going to be: a
@@ -2556,6 +2561,37 @@ fn order_front(receiver: Id, make_key: bool) {
     // the screen for real, and Qt does not treat its window as exposed - or act
     // on any of the input it is sent - until they arrive.
     crate::event::window_geometry_changed(receiver);
+}
+
+/// The SDL window of the window `receiver` is a dialog of, or null.
+///
+/// A Mac does not link a dialog to the window it was opened over, but a tiling
+/// compositor needs that link to float the dialog instead of tiling it at the
+/// size of a document window. A titled window without a miniaturize button is
+/// a dialog - Qt leaves the button off every `Qt::Dialog` - and it belongs to
+/// the key window, which is the one it was opened over.
+fn dialog_owner(receiver: Id) -> sdl3::Window {
+    let mask = window_of(receiver).style_mask;
+    let key = key_window();
+    if mask & style::TITLED == 0 || mask & style::MINIATURIZABLE != 0 || key == receiver {
+        return std::ptr::null_mut();
+    }
+    // Only a window in the table is known to be alive.
+    let Some(sdl) = WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, object)| *object == key as usize)
+        .map(|(sdl, _)| *sdl as sdl3::Window)
+    else {
+        return std::ptr::null_mut();
+    };
+    let owner = window_of(key);
+    if owner.shown == 0 || presentation(owner) != Presentation::Toplevel {
+        return std::ptr::null_mut();
+    }
+    trace!("{receiver:p} is a dialog of {key:p}");
+    sdl
 }
 
 /// `-setIsVisible:`, which is `-orderFront:` or `-orderOut:` by its argument.
@@ -4439,6 +4475,44 @@ mod tests {
             make_key_window(second, objc::sel::get("makeKeyWindow"));
             assert_eq!(key_window(), first);
         }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
+    fn a_titled_window_without_a_miniaturize_button_is_a_dialog_of_the_key_window() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        let document = made_window(
+            c"NSWindow",
+            style::TITLED | style::CLOSABLE | style::MINIATURIZABLE | style::RESIZABLE,
+        );
+        unsafe {
+            order_front_selector(
+                document,
+                objc::sel::get("orderFront:"),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(key_window(), document);
+
+        let dialog = made_window(
+            c"NSWindow",
+            style::TITLED | style::CLOSABLE | style::RESIZABLE,
+        );
+        assert_eq!(dialog_owner(dialog), window_of(document).sdl);
+        // A second document window, with the button, belongs to nothing.
+        let other = made_window(
+            c"NSWindow",
+            style::TITLED | style::CLOSABLE | style::MINIATURIZABLE | style::RESIZABLE,
+        );
+        assert!(dialog_owner(other).is_null());
+        // Nor is the key window a dialog of itself.
+        window_of(document).style_mask = style::TITLED;
+        assert!(dialog_owner(document).is_null());
     }
 
     #[test]

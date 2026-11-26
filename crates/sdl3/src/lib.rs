@@ -3311,6 +3311,9 @@ pub mod video {
         // worker runs; preserve parent ancestry until physical SDL deletion.
         retired: bool,
         closing: bool,
+        /// The toplevel this one is a dialog of, as far as the compositor is
+        /// told; see [`set_window_transient_for`]. Not part of the family.
+        transient_for: Option<usize>,
     }
 
     static LIVE_WINDOWS: std::sync::LazyLock<
@@ -3328,6 +3331,7 @@ pub mod video {
                     parent: parent.map(|parent| parent as usize),
                     retired: false,
                     closing: false,
+                    transient_for: None,
                 },
             );
         }
@@ -3343,6 +3347,7 @@ pub mod video {
                 parent: None,
                 retired: false,
                 closing: false,
+                transient_for: None,
             },
         );
     }
@@ -3560,6 +3565,7 @@ pub mod video {
                     parent: Some(parent as usize),
                     retired: false,
                     closing: false,
+                    transient_for: None,
                 },
             );
         }
@@ -3596,6 +3602,67 @@ pub mod video {
             return done;
         }
         unsafe { set_modal(window, true) }
+    }
+
+    /// Tell the compositor that `window` is a dialog of `parent`, or of nothing
+    /// when `parent` is null, so that a tiling compositor floats it.
+    ///
+    /// `SDL_SetWindowParent` is how, and it also makes SDL destroy `window`
+    /// with `parent`. A dialog's window belongs to its `NSWindow`, not to the
+    /// window it was opened over, so it is not made part of `parent`'s family:
+    /// [`destroy_window_now`] lets go of it before `parent` goes instead.
+    ///
+    /// Not on macOS, where SDL makes `window` a child window of `parent`, which
+    /// moves with it: a dialog there is a window of its own, as it is to the
+    /// guest.
+    pub fn set_window_transient_for(window: Window, parent: Window) -> bool {
+        if cfg!(target_os = "macos") || crate::desktop::active() {
+            return false;
+        }
+        let Some(set_parent) = api().and_then(|a| a.SDL_SetWindowParent) else {
+            return false;
+        };
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        let toplevel = |window: Window| {
+            live.get(&(window as usize))
+                .is_some_and(|state| !state.retired && !state.closing && state.parent.is_none())
+        };
+        if !toplevel(window) || (!parent.is_null() && !toplevel(parent)) {
+            return false;
+        }
+        let want = (!parent.is_null()).then_some(parent as usize);
+        let state = live
+            .get_mut(&(window as usize))
+            .expect("checked live window");
+        if state.transient_for == want {
+            return true;
+        }
+        // SAFETY: two windows this crate created, or one and null.
+        if !unsafe { set_parent(window, parent) } {
+            return false;
+        }
+        state.transient_for = want;
+        true
+    }
+
+    /// Let go of the dialogs of `window` and of its family before SDL
+    /// destroys them, which it would otherwise do to the dialogs too.
+    fn release_transients(window: Window) {
+        let Some(set_parent) = api().and_then(|a| a.SDL_SetWindowParent) else {
+            return;
+        };
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        let family = family_keys(&live, window as usize);
+        for (&key, state) in live.iter_mut() {
+            if state
+                .transient_for
+                .is_some_and(|parent| family.contains(&parent))
+            {
+                // SAFETY: a live window this crate created, and null.
+                unsafe { set_parent(key as Window, std::ptr::null_mut()) };
+                state.transient_for = None;
+            }
+        }
     }
 
     /// The window a popup is positioned against, or null for a toplevel.
@@ -3731,6 +3798,7 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_DestroyWindow) else {
             return;
         };
+        release_transients(window);
         forget_native_window_family(window);
         // SAFETY: the SDL owner thread has finished using this window.
         keep_gl_context(|| unsafe { f(window) });
