@@ -41,6 +41,12 @@ pub mod darwin {
     pub const MS_SYNC: i32 = 0x0010;
 }
 
+/// The end of the addresses a Mac ever gives a process mappings at, on either
+/// architecture: x86-64's lower canonical half, which also bounds arm64's
+/// `MACH_VM_MAX_ADDRESS`. Programs size tables by it; mimalloc's page map
+/// covers exactly this much.
+pub const USER_ADDRESS_END: u64 = 1 << 47;
+
 /// Whether `flags` asks for anonymous memory, in Darwin's spelling.
 ///
 /// Asked separately from [`map_flags`] because the descriptor has to be dealt

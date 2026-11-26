@@ -111,6 +111,60 @@ pub fn anonymous(len: usize, prot: c_int) -> io::Result<NonNull<u8>> {
     }
 }
 
+/// Fill the address space at or above `limit` that the kernel would pick for a
+/// new mapping with inaccessible reservations, so that from now on every
+/// mapping placed at no fixed address lands below `limit`.
+///
+/// The kernel finds the holes itself: a request too large for any hole above
+/// `limit` lands below it and is given back, and the size halves down to a
+/// page. Nothing is allocated, so this can run before the allocator first
+/// does. Skipped under a finite `RLIMIT_AS`, which the reservations count
+/// against.
+///
+/// FIXME (ACCURACY): a mapping above `limit` that exists already and is unmapped
+/// later leaves a hole the kernel can place a new mapping in.
+pub fn confine_below(limit: usize) {
+    let mut rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlimit` is a valid out-pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut rlimit) } != 0
+        || rlimit.rlim_cur != libc::RLIM_INFINITY
+    {
+        return;
+    }
+    let page = crate::system::page_size() as usize;
+    let mut len = limit & !(page - 1);
+    while len >= page {
+        // SAFETY: a reservation at no fixed address displaces nothing.
+        let start = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if start == libc::MAP_FAILED {
+            len /= 2;
+            continue;
+        }
+        let end = start as usize + len;
+        // SAFETY: the parts unmapped are of the reservation just made.
+        unsafe {
+            if end <= limit {
+                libc::munmap(start, len);
+                len /= 2;
+            } else if (start as usize) < limit {
+                libc::munmap(start, limit - start as usize);
+            }
+        }
+    }
+}
+
 fn fault(address: usize, offset: usize) -> Fault {
     let kind = match mapped(address.wrapping_add(offset)) {
         true => FaultKind::Protection,

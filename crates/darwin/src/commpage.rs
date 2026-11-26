@@ -9,6 +9,8 @@
 //! count is a snapshot, and the comm page text (preemption-free zone,
 //! `_COMM_PAGE_RET`, ...) is not mapped.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::cpu::{Feature, has};
 use crate::sysctl::{GuestArch, guest_arch, is_translated};
 
@@ -72,6 +74,36 @@ const K_HAS_AVX512BITALG: u64 = 0x0001_0000_0000_0000;
 const K_HAS_AVX512VPOPCNTDQ: u64 = 0x0002_0000_0000_0000;
 const K_IS_TRANSLATED: u64 = 0x4000_0000_0000_0000;
 
+/// Whether [`reserve`] holds the comm page's address.
+static RESERVED: AtomicBool = AtomicBool::new(false);
+
+/// Hold the comm page's address with an inaccessible page, for [`install`] to
+/// map over. Needed before anything else maps memory where the host places new
+/// mappings just below it, as it does once confined to a Mac's address range.
+/// An arm64 guest leaves the page unused, as a Mac has nothing there.
+pub fn reserve() {
+    let wanted = COMM_PAGE64_BASE_ADDRESS as usize as *mut libc::c_void;
+    // SAFETY: a hint, so this replaces nothing.
+    let page = unsafe {
+        libc::mmap(
+            wanted,
+            COMM_PAGE64_AREA_LENGTH,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    match page {
+        libc::MAP_FAILED => {}
+        page if page == wanted => RESERVED.store(true, Ordering::Relaxed),
+        // SAFETY: `page` is the mapping just made, and nothing refers to it.
+        page => unsafe {
+            libc::munmap(page, COMM_PAGE64_AREA_LENGTH);
+        },
+    }
+}
+
 /// Map and fill the comm page for an x86-64 guest. Does nothing for an arm64
 /// guest, whose comm page lives elsewhere and is not provided.
 pub fn install() -> std::io::Result<()> {
@@ -79,15 +111,21 @@ pub fn install() -> std::io::Result<()> {
         return Ok(());
     }
     let wanted = COMM_PAGE64_BASE_ADDRESS as usize as *mut libc::c_void;
-    // A hint rather than a fixed mapping, so that a host which already has
-    // something there keeps it and this reports the clash instead.
-    // SAFETY: an anonymous private mapping that replaces nothing.
+    // Fixed only over this module's own reservation. Otherwise a hint, so
+    // that a host which already has something there keeps it and this
+    // reports the clash instead.
+    let fixed = match RESERVED.load(Ordering::Relaxed) {
+        true => libc::MAP_FIXED,
+        false => 0,
+    };
+    // SAFETY: an anonymous private mapping that replaces at most the
+    // reservation, which nothing refers to.
     let page = unsafe {
         libc::mmap(
             wanted,
             COMM_PAGE64_AREA_LENGTH,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | fixed,
             -1,
             0,
         )
