@@ -119,6 +119,20 @@ fn transformer(binder: &Binder) -> Id {
     )
 }
 
+/// `@YES` or `@NO`.
+fn boolean(value: bool) -> Id {
+    let class = objc::class::lookup(c"NSNumber").expect("NSNumber");
+    // SAFETY: `+numberWithBool:` is `id (Class, SEL, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, u8) -> Id = std::mem::transmute(objc::msg::entry());
+        f(
+            objc::class::ptr(class) as Id,
+            objc::sel::get("numberWithBool:"),
+            value as u8,
+        )
+    }
+}
+
 fn is_null_object(value: Id) -> bool {
     !value.is_null() && is_kind(value, c"NSNull")
 }
@@ -153,6 +167,51 @@ fn as_bool(value: Id) -> bool {
     }
 }
 
+fn as_double(value: Id) -> f64 {
+    if value.is_null() || !responds(value, "doubleValue") {
+        return 0.0;
+    }
+    // SAFETY: `double (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+        f(value, objc::sel::get("doubleValue"))
+    }
+}
+
+/// A progress indicator's `animate` binding: it starts or stops.
+fn animate(owner: Id, value: Id) {
+    let sel = match as_bool(value) {
+        true => "startAnimation:",
+        false => "stopAnimation:",
+    };
+    send_id_id(owner, sel, std::ptr::null_mut());
+}
+
+/// Properties AppKit binds several values to, numbering the bindings after
+/// the first: `hidden`, `hidden2`, ...
+const COMBINED: [&str; 3] = ["hidden", "enabled", "editable"];
+
+/// The property a binding of this name is one of several values of.
+fn combined_base(name: &str) -> Option<&'static str> {
+    let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    COMBINED.into_iter().find(|b| *b == base)
+}
+
+/// The value of a combined property: whether any of its bindings says
+/// hidden, or all of them enabled or editable.
+fn combined(owner: Id, base: &str) -> bool {
+    const MOST: usize = 9;
+    let values: Vec<bool> = std::iter::once(base.to_string())
+        .chain((2..=MOST).map(|n| format!("{base}{n}")))
+        .filter_map(|name| binder_of(owner, &name))
+        .map(|binder| as_bool(presented(binder)))
+        .collect();
+    match base {
+        "hidden" => values.iter().any(|v| *v),
+        _ => values.iter().all(|v| *v),
+    }
+}
+
 fn as_integer(value: Id) -> isize {
     if value.is_null() || !responds(value, "integerValue") {
         return 0;
@@ -169,6 +228,7 @@ enum Setter {
     Object(&'static str),
     Bool(&'static str),
     Integer(&'static str),
+    Double(&'static str),
     /// A binding with no public setter, kept by this crate.
     Private(fn(Id, Id)),
 }
@@ -183,6 +243,11 @@ fn setter_for(owner: Id, name: &str) -> Option<Setter> {
         {
             Setter::Integer("setState:")
         }
+        "value" if is_kind(owner, c"NSImageView") => Setter::Object("setImage:"),
+        "value" if is_kind(owner, c"NSProgressIndicator") => Setter::Double("setDoubleValue:"),
+        "maxValue" if is_kind(owner, c"NSProgressIndicator") => Setter::Double("setMaxValue:"),
+        "minValue" if is_kind(owner, c"NSProgressIndicator") => Setter::Double("setMinValue:"),
+        "animate" if is_kind(owner, c"NSProgressIndicator") => Setter::Private(animate),
         "value" => Setter::Object("setObjectValue:"),
         "contentArray" | "contentObject" if is_kind(owner, c"NSObjectController") => {
             Setter::Object("setContent:")
@@ -213,9 +278,13 @@ fn setter_for(owner: Id, name: &str) -> Option<Setter> {
 
 /// Hand the observed value to the bound object.
 fn apply(binder: &Binder) {
-    let value = presented(binder);
-    let name = text(binder.name);
+    let mut value = presented(binder);
+    let mut name = text(binder.name);
     let owner = binder.owner;
+    if let Some(base) = combined_base(&name) {
+        value = boolean(combined(owner, base));
+        name = base.to_string();
+    }
     match setter_for(owner, &name) {
         Some(Setter::Private(set)) => set(owner, value),
         Some(Setter::Object(sel)) if responds(owner, sel) => {
@@ -230,6 +299,11 @@ fn apply(binder: &Binder) {
         Some(Setter::Integer(sel)) if responds(owner, sel) => unsafe {
             let f: unsafe extern "C" fn(Id, Sel, isize) = std::mem::transmute(objc::msg::entry());
             f(owner, objc::sel::get(sel), as_integer(value));
+        },
+        // SAFETY: `void (id, SEL, double)`.
+        Some(Setter::Double(sel)) if responds(owner, sel) => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc::msg::entry());
+            f(owner, objc::sel::get(sel), as_double(value));
         },
         // Anything else is the plain `NSObject` binding: the binding's name is
         // a key on the bound object.
@@ -652,3 +726,55 @@ pub(crate) fn install() {
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_of(name: &CStr) -> Id {
+        crate::bootstrap();
+        let class = objc::class::lookup(name).expect("a class");
+        send_id(send_id(objc::class::ptr(class) as Id, "alloc"), "init")
+    }
+
+    /// Set a key of a dictionary, announcing the change to its observers.
+    fn set(object: Id, key: &str, value: bool) {
+        let name = key;
+        let key = string(key);
+        crate::tree_controller::announce(object, "willChangeValueForKey:", name);
+        // SAFETY: `void (id, SEL, id, NSString *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+            f(object, objc::sel::get("setValue:forKey:"), boolean(value), key);
+        }
+        crate::tree_controller::announce(object, "didChangeValueForKey:", name);
+        release_string(key);
+    }
+
+    fn bind(view: Id, name: &str, model: Id, key_path: &str) {
+        let (name, key_path) = (string(name), string(key_path));
+        // SAFETY: the receiver's own method.
+        unsafe { super::bind(view, std::ptr::null(), name, model, key_path, std::ptr::null_mut()) };
+        release_string(name);
+        release_string(key_path);
+    }
+
+    /// `hidden` and `hidden2` are one property: hidden while either says so.
+    #[test]
+    fn numbered_hidden_bindings_hide_the_view_while_any_says_so() {
+        let model = object_of(c"NSMutableDictionary");
+        set(model, "busy", false);
+        set(model, "gone", false);
+        let view = object_of(c"NSView");
+        bind(view, "hidden", model, "busy");
+        bind(view, "hidden2", model, "gone");
+        assert_eq!(tree_word(view, "isHidden"), 0);
+        set(model, "gone", true);
+        assert_eq!(tree_word(view, "isHidden"), 1);
+        set(model, "gone", false);
+        assert_eq!(tree_word(view, "isHidden"), 0);
+    }
+
+    fn tree_word(receiver: Id, sel: &str) -> u8 {
+        crate::tree_controller::send_word(receiver, sel) as u8
+    }
+}
