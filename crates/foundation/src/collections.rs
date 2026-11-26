@@ -140,17 +140,28 @@ unsafe extern "C" fn last_object(receiver: Id, sel: Sel) -> Id {
     }
 }
 
-unsafe extern "C" fn sorted_array_using_selector(receiver: Id, _sel: Sel, _compare: Sel) -> Id {
-    // Apps use this with NSString keys and `caseInsensitiveCompare:`. Keep
-    // the ordering deterministic while avoiding guest callbacks during sort.
+/// `values` ordered by sending each pair `compare`, as `-[a compare:b]`,
+/// stably, as Apple's merge sort is.
+fn sort_by_selector(values: &mut [CFTypeRef], compare: Sel) {
+    // SAFETY: `NSComparisonResult (id, SEL, id)`, which a comparison selector is.
+    let call: unsafe extern "C" fn(Id, Sel, Id) -> isize =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    // SAFETY: the guest's method, sent to two of the array's objects.
+    values.sort_by(|a, b| match unsafe { call(*a as Id, compare, *b as Id) } {
+        ..0 => std::cmp::Ordering::Less,
+        0 => std::cmp::Ordering::Equal,
+        _ => std::cmp::Ordering::Greater,
+    });
+}
+
+unsafe extern "C" fn sorted_array_using_selector(receiver: Id, _sel: Sel, compare: Sel) -> Id {
+    // SAFETY: an array.
     let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
     };
+    // Sorted out of place: the comparison may read the array it is sorting.
     let mut values = array.values.clone();
-    values.sort_by_cached_key(|value| {
-        // SAFETY: this Foundation entry point is used with NSString arrays.
-        unsafe { crate::string::bytes(*value as Id) }.to_ascii_lowercase()
-    });
+    sort_by_selector(&mut values, compare);
     // SAFETY: a fresh array follows the convenience-constructor rule.
     unsafe {
         api::CFAutorelease(collections::new_array(
@@ -158,6 +169,23 @@ unsafe extern "C" fn sorted_array_using_selector(receiver: Id, _sel: Sel, _compa
             Policy::from_type_callbacks(),
             false,
         )) as Id
+    }
+}
+
+unsafe extern "C" fn sort_using_selector(receiver: Id, _sel: Sel, compare: Sel) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if !array.mutable {
+        immutable("NSArray", "sortUsingSelector:");
+    }
+    // Sorted out of place: the comparison may read the array it is sorting.
+    let mut values = array.values.clone();
+    sort_by_selector(&mut values, compare);
+    // SAFETY: the same array; the comparison is done with it.
+    if let Some(array) = unsafe { collections::array(receiver as CFTypeRef) } {
+        array.values = values;
     }
 }
 
@@ -3059,6 +3087,7 @@ pub(crate) fn install() {
         "setObject:atIndexedSubscript:" => set_object_at_indexed_subscript, c"v32@0:8@16Q24";
         "sortUsingFunction:context:" => sort_using_function, c"v32@0:8^?16^v24";
         "sortUsingComparator:" => sort_using_comparator, c"v24@0:8@?16";
+        "sortUsingSelector:" => sort_using_selector, c"v24@0:8:16";
         "removeAllObjects" => remove_all_objects, c"v16@0:8";
         "setArray:" => set_array, c"v24@0:8@16";
     });
@@ -3277,6 +3306,30 @@ mod tests {
         unsafe {
             set_add_object(set, objc::sel::get("addObject:"), member);
             assert_eq!(set_count(set, objc::sel::get("count")), 1);
+        }
+    }
+
+    #[test]
+    fn sort_using_selector_orders_by_the_named_comparison() {
+        crate::bootstrap();
+        let strings = ["b", "C", "a"].map(|s| crate::string::from_str(s) as CFTypeRef);
+        let array = collections::new_array(&strings, Policy::from_type_callbacks(), true) as Id;
+        // SAFETY: a mutable array of strings, which answer `-compare:`.
+        unsafe {
+            sort_using_selector(
+                array,
+                objc::sel::get("sortUsingSelector:"),
+                objc::sel::get("compare:"),
+            )
+        };
+        let at = objc::sel::get("objectAtIndex:");
+        // SAFETY: an array of three.
+        let sorted = [0, 1, 2].map(|i| unsafe { object_at_index(array, at, i) } as CFTypeRef);
+        // `-compare:` is literal, so uppercase sorts first.
+        assert_eq!(sorted, [strings[1], strings[2], strings[0]]);
+        objc::arc::release(array);
+        for string in strings {
+            objc::arc::release(string as Id);
         }
     }
 
