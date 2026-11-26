@@ -83,6 +83,11 @@ fn date_of(receiver: Id) -> f64 {
     unsafe { (*(receiver as *const Date)).interval }
 }
 
+/// Immutable, so a copy is the same date.
+unsafe extern "C" fn date_copy_with_zone(receiver: Id, _sel: Sel, _zone: *const ()) -> Id {
+    objc::arc::retain(receiver)
+}
+
 unsafe extern "C" fn date_now(_class: Id, _sel: Sel) -> Id {
     date(now())
 }
@@ -601,6 +606,7 @@ pub(crate) fn install() {
     });
     methods!(date_class, {
         "timeIntervalSinceReferenceDate" => time_interval_since_reference, c"d16@0:8";
+        "copyWithZone:" => date_copy_with_zone, c"@24@0:8^v16";
         "timeIntervalSinceNow" => time_interval_since_now, c"d16@0:8";
         "timeIntervalSince1970" => time_interval_since_1970, c"d16@0:8";
         "timeIntervalSinceDate:" => time_interval_since_date, c"d24@0:8@16";

@@ -107,6 +107,23 @@ unsafe extern "C" fn home_directory() -> Id {
     crate::string::from_str(&crate::home_directory())
 }
 
+/// `NSString *NSHomeDirectoryForUser(NSString *userName)`: nil for a user
+/// there is no account for, and this user's own home for a nil name.
+unsafe extern "C" fn home_directory_for_user(user: Id) -> Id {
+    if user.is_null() {
+        // SAFETY: no arguments.
+        return unsafe { home_directory() };
+    }
+    // SAFETY: a string object.
+    let Ok(name) = std::ffi::CString::new(unsafe { crate::string::bytes(user) }) else {
+        return std::ptr::null_mut();
+    };
+    match darwin::passwd::home(Some(&name)) {
+        Some(home) => objc::arc::autorelease(crate::string::from_str(&home.to_string_lossy())),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// The `~/Library` subdirectories every Mac ships, created if this host has not
 /// got them.
 ///
@@ -144,6 +161,7 @@ exports::exports! {
     functions {
         "NSSearchPathForDirectoriesInDomains" => search_path,
         "NSHomeDirectory" => home_directory,
+        "NSHomeDirectoryForUser" => home_directory_for_user,
         "NSTemporaryDirectory" => temporary_directory,
     }
 }

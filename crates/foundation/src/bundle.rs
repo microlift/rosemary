@@ -701,6 +701,26 @@ pub mod cf {
         object
     }
 
+    /// `CFDictionaryRef CFBundleCopyInfoDictionaryInDirectory(CFURLRef bundleURL)`
+    ///
+    /// The `Info.plist` of the bundle at `url`, read without making a bundle of
+    /// it. Null when the directory is not one.
+    unsafe extern "C" fn CFBundleCopyInfoDictionaryInDirectory(url: Id) -> Id {
+        // SAFETY: a `CFURL` or null.
+        let Some(guest) = (unsafe { corefoundation::url::as_url(url as CFTypeRef) })
+            .and_then(|url| url.file_path())
+        else {
+            return std::ptr::null_mut();
+        };
+        let Some(layout) = super::Layout::at(&super::opened(std::path::Path::new(&guest))) else {
+            return std::ptr::null_mut();
+        };
+        let object =
+            crate::objectify::object(&layout.info, "CFBundleCopyInfoDictionaryInDirectory");
+        // A `Copy`: the caller owns a reference.
+        objc::arc::retain(object)
+    }
+
     unsafe extern "C" fn CFBundleGetInfoDictionary(bundle: Id) -> Id {
         info_dictionary(bundle)
     }
@@ -769,6 +789,22 @@ pub mod cf {
             unsafe { corefoundation::api::CFRelease(number) };
         }
         array as Id
+    }
+
+    /// `Boolean CFBundleIsArchitectureLoadable(cpu_type_t)`
+    ///
+    /// An arm64 Mac answers x86-64 by whether Rosetta is installed; this
+    /// runtime is what translates x86-64 code here, so it is loadable. An
+    /// x86-64 process loads only its own.
+    unsafe extern "C" fn CFBundleIsArchitectureLoadable(cpu: i32) -> u8 {
+        /// `CPU_TYPE_X86_64` and `CPU_TYPE_ARM64`, from `<mach/machine.h>`.
+        const X86_64: i32 = 0x0100_0007;
+        const ARM64: i32 = 0x0100_000c;
+        let loadable = match darwin::sysctl::guest_arch() {
+            darwin::sysctl::GuestArch::Arm64 => matches!(cpu, ARM64 | X86_64),
+            darwin::sysctl::GuestArch::X86_64 => cpu == X86_64,
+        };
+        loadable as u8
     }
 
     /// `CFArrayRef CFBundleCopyExecutableArchitecturesForURL(CFURLRef)`
@@ -1036,7 +1072,9 @@ pub mod cf {
             "CFBundleGetPackageInfo" => CFBundleGetPackageInfo,
             "CFBundleCopyExecutableArchitectures" => CFBundleCopyExecutableArchitectures,
             "CFBundleCopyExecutableArchitecturesForURL" => CFBundleCopyExecutableArchitecturesForURL,
+            "CFBundleIsArchitectureLoadable" => CFBundleIsArchitectureLoadable,
             "CFBundleCreate" => CFBundleCreate,
+            "CFBundleCopyInfoDictionaryInDirectory" => CFBundleCopyInfoDictionaryInDirectory,
             "CFBundleCreateBundlesFromDirectory" => CFBundleCreateBundlesFromDirectory,
             "CFBundleLoadExecutable" => CFBundleLoadExecutable,
             "CFBundleGetFunctionPointerForName" => CFBundleGetFunctionPointerForName,
@@ -1881,6 +1919,8 @@ pub(crate) mod class {
         }))
     }
 
+    const SHARED_SUPPORT: &str = "SharedSupport";
+
     unsafe extern "C" fn private_frameworks_path(receiver: Id, _sel: Sel) -> Id {
         path(unsafe { layout_of(receiver) }.map(|b| b.frameworks.clone()))
     }
@@ -1890,6 +1930,24 @@ pub(crate) mod class {
     /// the wrong one and finds nothing.
     unsafe extern "C" fn built_in_plug_ins_path(receiver: Id, _sel: Sel) -> Id {
         path(unsafe { layout_of(receiver) }.map(|b| b.plugins.clone()))
+    }
+
+    unsafe extern "C" fn private_frameworks_url(receiver: Id, _sel: Sel) -> Id {
+        url(unsafe { layout_of(receiver) }.map(|b| b.frameworks.clone()))
+    }
+
+    unsafe extern "C" fn built_in_plug_ins_url(receiver: Id, _sel: Sel) -> Id {
+        url(unsafe { layout_of(receiver) }.map(|b| b.plugins.clone()))
+    }
+
+    /// `Contents/SharedSupport`, answered whether or not it exists, as
+    /// CFBundle answers.
+    unsafe extern "C" fn shared_support_path(receiver: Id, _sel: Sel) -> Id {
+        path(unsafe { layout_of(receiver) }.map(|b| b.contents.join(SHARED_SUPPORT)))
+    }
+
+    unsafe extern "C" fn shared_support_url(receiver: Id, _sel: Sel) -> Id {
+        url(unsafe { layout_of(receiver) }.map(|b| b.contents.join(SHARED_SUPPORT)))
     }
 
     unsafe extern "C" fn bundle_identifier(receiver: Id, _sel: Sel) -> Id {
@@ -1986,6 +2044,10 @@ pub(crate) mod class {
             "pathForAuxiliaryExecutable:" => path_for_auxiliary_executable, c"@24@0:8@16";
             "privateFrameworksPath" => private_frameworks_path, c"@16@0:8";
             "builtInPlugInsPath" => built_in_plug_ins_path, c"@16@0:8";
+            "privateFrameworksURL" => private_frameworks_url, c"@16@0:8";
+            "builtInPlugInsURL" => built_in_plug_ins_url, c"@16@0:8";
+            "sharedSupportPath" => shared_support_path, c"@16@0:8";
+            "sharedSupportURL" => shared_support_url, c"@16@0:8";
             "bundleIdentifier" => bundle_identifier, c"@16@0:8";
             "objectForInfoDictionaryKey:" => object_for_info_key, c"@24@0:8@16";
             "pathForResource:ofType:" => path_for_resource, c"@32@0:8@16@24";

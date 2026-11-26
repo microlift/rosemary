@@ -53,9 +53,40 @@ pub fn cf_encoding(ns: usize) -> u32 {
 ///
 /// `receiver` must be null or an object this runtime allocated.
 pub unsafe fn bytes(receiver: Id) -> Vec<u8> {
-    unsafe { corefoundation::string::as_string(receiver as CFTypeRef) }
-        .map(|s| s.utf8())
+    if let Some(string) = unsafe { corefoundation::string::as_string(receiver as CFTypeRef) } {
+        return string.utf8();
+    }
+    // SAFETY: the caller's guarantee.
+    unsafe { subclass_units(receiver) }
+        .map(|units| String::from_utf16_lossy(&units).into_bytes())
         .unwrap_or_default()
+}
+
+/// The characters of an `NSString` whose class is not this runtime's - a
+/// guest's own subclass, such as a bridge's proxy for its language's strings -
+/// asked through the two methods every subclass implements, as a class
+/// cluster asks them.
+///
+/// # Safety
+///
+/// `receiver` must be null or an object this runtime allocated.
+unsafe fn subclass_units(receiver: Id) -> Option<Vec<u16>> {
+    let string = objc::class::lookup(c"NSString")?;
+    // SAFETY: the caller's guarantee.
+    if receiver.is_null() || !unsafe { corefoundation::base::is_kind_of(receiver as _, string) } {
+        return None;
+    }
+    // SAFETY: `-length` is `NSUInteger (id, SEL)` and `-characterAtIndex:` is
+    // `unichar (id, SEL, NSUInteger)`, on any `NSString`.
+    unsafe {
+        let length: unsafe extern "C" fn(Id, Sel) -> usize =
+            std::mem::transmute(objc::msg::entry());
+        let character: unsafe extern "C" fn(Id, Sel, usize) -> u16 =
+            std::mem::transmute(objc::msg::entry());
+        let count = length(receiver, objc::sel::get("length"));
+        let at = objc::sel::get("characterAtIndex:");
+        Some((0..count).map(|i| character(receiver, at, i)).collect())
+    }
 }
 
 unsafe extern "C" fn length(receiver: Id, _sel: Sel) -> usize {

@@ -324,11 +324,15 @@ struct DateFormat {
     pattern: Option<String>,
     /// Retained, or null for this machine's zone.
     timezone: CFTypeRef,
+    /// `-setCalendar:`, retained, or null. Only Gregorian calendars are made,
+    /// so it changes no field.
+    calendar: CFTypeRef,
 }
 
 impl Drop for DateFormat {
     fn drop(&mut self) {
         objc::arc::release(self.timezone as Id);
+        objc::arc::release(self.calendar as Id);
     }
 }
 
@@ -369,6 +373,7 @@ impl DateFormat {
             time,
             pattern: None,
             timezone: std::ptr::null(),
+            calendar: std::ptr::null(),
         }
     }
 
@@ -579,6 +584,225 @@ fn render_pattern(pattern: &str, when: f64, offset: i64) -> String {
     out
 }
 
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = of_era * 365 + of_era / 4 - of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// The proleptic Gregorian `(year, month, day)` of a day since 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let of_era = days - era * 146_097;
+    let year_of_era = (of_era - of_era / 1460 + of_era / 36524 - of_era / 146_096) / 365;
+    let day_of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted + 2) / 5 + 1;
+    let month = if shifted < 10 {
+        shifted + 3
+    } else {
+        shifted - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    days_from_civil(year + month / 12, month % 12 + 1, 1) - days_from_civil(year, month, 1)
+}
+
+/// The fields a pattern read out of a string.
+#[derive(Default)]
+struct Parsed {
+    year: Option<i64>,
+    month: Option<i64>,
+    day: Option<i64>,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    fraction: f64,
+    /// `Some(true)` for PM, from an `a` field.
+    pm: Option<bool>,
+    twelve_hour: bool,
+    /// Seconds east of UTC, from a zone field.
+    offset: Option<i64>,
+}
+
+/// `text` read through an LDML pattern, or `None` when it does not match it
+/// exactly - which is when `-dateFromString:` answers nil.
+///
+/// Numeric fields, month names, the day period and numeric zone offsets are
+/// read. A pattern letter outside those is named and the parse refused, rather
+/// than the field skipped and a different date answered.
+fn parse_pattern(pattern: &str, text: &str) -> Option<Parsed> {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut parsed = Parsed::default();
+    let (mut at, mut read) = (0, 0);
+    let digits = |read: &mut usize, most: usize| -> Option<i64> {
+        let start = *read;
+        while *read < text.len() && *read - start < most && text[*read].is_ascii_digit() {
+            *read += 1;
+        }
+        (*read > start).then(|| text[start..*read].iter().collect::<String>().parse().ok())?
+    };
+    while at < pattern.len() {
+        let c = pattern[at];
+        if c == '\'' {
+            // `''` is a quote; otherwise everything up to the next quote is literal.
+            at += 1;
+            if pattern.get(at) == Some(&'\'') {
+                (text.get(read) == Some(&'\'')).then_some(())?;
+                read += 1;
+                at += 1;
+                continue;
+            }
+            while at < pattern.len() && pattern[at] != '\'' {
+                (text.get(read) == Some(&pattern[at])).then_some(())?;
+                read += 1;
+                at += 1;
+            }
+            at += 1;
+            continue;
+        }
+        if !c.is_ascii_alphabetic() {
+            (text.get(read) == Some(&c)).then_some(())?;
+            read += 1;
+            at += 1;
+            continue;
+        }
+        let run = pattern[at..].iter().take_while(|next| **next == c).count();
+        at += run;
+        // A field run against the next one has no separator to stop at, so it
+        // takes its own width; otherwise it takes every digit there is.
+        let abutting = pattern
+            .get(at)
+            .is_some_and(|next| next.is_ascii_alphabetic());
+        let width = |natural: usize| match abutting {
+            true => run.max(natural),
+            false => usize::MAX,
+        };
+        match c {
+            'y' | 'u' => {
+                let year = digits(&mut read, width(4))?;
+                parsed.year = Some(match run {
+                    2 => 2000 + year,
+                    _ => year,
+                });
+            }
+            'M' | 'L' if run <= 2 => parsed.month = Some(digits(&mut read, width(2))?),
+            'M' | 'L' => {
+                let rest: String = text[read..].iter().collect();
+                let (index, length) =
+                    MONTHS.iter().enumerate().find_map(|(i, (long, short))| {
+                        let name = if run == 3 { short } else { long };
+                        rest.starts_with(name).then_some((i, name.chars().count()))
+                    })?;
+                parsed.month = Some(index as i64 + 1);
+                read += length;
+            }
+            'd' => parsed.day = Some(digits(&mut read, width(2))?),
+            'H' => parsed.hour = digits(&mut read, width(2))?,
+            'h' => {
+                parsed.hour = digits(&mut read, width(2))? % 12;
+                parsed.twelve_hour = true;
+            }
+            'm' => parsed.minute = digits(&mut read, width(2))?,
+            's' => parsed.second = digits(&mut read, width(2))?,
+            'S' => {
+                let start = read;
+                let value = digits(&mut read, width(run))?;
+                parsed.fraction = value as f64 / 10f64.powi((read - start) as i32);
+            }
+            'a' => {
+                let rest: String = text[read..].iter().take(2).collect();
+                parsed.pm = Some(match rest.as_str() {
+                    "AM" => false,
+                    "PM" => true,
+                    _ => return None,
+                });
+                read += 2;
+            }
+            'Z' | 'x' | 'X' => {
+                // `X` and five `Z`s write a zero offset as `Z`.
+                if (c == 'X' || (c == 'Z' && run == 5)) && text.get(read) == Some(&'Z') {
+                    parsed.offset = Some(0);
+                    read += 1;
+                    continue;
+                }
+                let sign = match text.get(read) {
+                    Some('+') => 1,
+                    Some('-') => -1,
+                    _ => return None,
+                };
+                read += 1;
+                let hours = digits(&mut read, 2)?;
+                if text.get(read) == Some(&':') {
+                    read += 1;
+                }
+                let minutes = match text.get(read).is_some_and(char::is_ascii_digit) {
+                    true => digits(&mut read, 2)?,
+                    false => 0,
+                };
+                parsed.offset = Some(sign * (hours * 3600 + minutes * 60));
+            }
+            other => {
+                eprintln!(
+                    "rosemary: foundation: -dateFromString: cannot read the pattern letter \
+                     {other:?}, so the date is not parsed"
+                );
+                return None;
+            }
+        }
+    }
+    (read == text.len()).then_some(parsed)
+}
+
+/// The Unix timestamp `parsed` names, its wall-clock fields read in
+/// `timezone` unless it carried an offset of its own.
+///
+/// # Safety
+///
+/// `timezone` is null or a time zone.
+unsafe fn compose(parsed: &Parsed, timezone: CFTypeRef) -> Option<f64> {
+    let year = parsed.year.unwrap_or(1970);
+    let month = parsed.month.unwrap_or(1);
+    let day = parsed.day.unwrap_or(1);
+    let hour = match parsed.pm == Some(true) && parsed.hour < 12 {
+        true => parsed.hour + 12,
+        false => parsed.hour,
+    };
+    let valid = (1..=12).contains(&month)
+        && (1..=days_in_month(year, month)).contains(&day)
+        && (0..24).contains(&hour)
+        && (0..60).contains(&parsed.minute)
+        && (0..60).contains(&parsed.second);
+    if !valid {
+        return None;
+    }
+    let wall = (days_from_civil(year, month, day) * 86_400
+        + hour * 3600
+        + parsed.minute * 60
+        + parsed.second) as f64
+        + parsed.fraction;
+    let offset = match parsed.offset {
+        Some(offset) => offset,
+        // The zone's offset where that wall time falls, asked twice so a wall
+        // time across a change from the first guess still lands right.
+        // SAFETY: the caller's guarantee.
+        None => unsafe {
+            let first = offset_at(timezone, wall);
+            offset_at(timezone, wall - first as f64)
+        },
+    };
+    Some(wall - offset as f64)
+}
+
 /// Seconds east of UTC at `when` in `timezone`, null being this machine's zone.
 ///
 /// # Safety
@@ -686,6 +910,41 @@ mod objc_api {
     /// the module note.
     unsafe extern "C" fn set_locale(_receiver: Id, _sel: Sel, _locale: Id) {}
 
+    unsafe extern "C" fn set_calendar(receiver: Id, _sel: Sel, calendar: Id) {
+        // SAFETY: a formatter.
+        if let Some(format) = unsafe { format(receiver) } {
+            let old = std::mem::replace(
+                &mut format.calendar,
+                objc::arc::retain(calendar) as CFTypeRef,
+            );
+            objc::arc::release(old as Id);
+        }
+    }
+
+    unsafe extern "C" fn calendar(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: a formatter.
+        unsafe { format(receiver) }.map_or(std::ptr::null_mut(), |format| format.calendar as Id)
+    }
+
+    /// `-dateFromString:`, read through the format the formatter was given.
+    ///
+    /// FIXME (ACCURACY): a formatter with only date and time styles parses
+    /// nothing, where Apple reads the styled form back.
+    unsafe extern "C" fn date_from_string(receiver: Id, _sel: Sel, string: Id) -> Id {
+        // SAFETY: a formatter, and a string or nil.
+        let (Some(format), false) = (unsafe { format(receiver) }, string.is_null()) else {
+            return std::ptr::null_mut();
+        };
+        let Some(pattern) = &format.pattern else {
+            return std::ptr::null_mut();
+        };
+        let text = String::from_utf8_lossy(&unsafe { crate::string::bytes(string) }).into_owned();
+        // SAFETY: the zone this formatter retained, or null.
+        super::parse_pattern(pattern, &text)
+            .and_then(|parsed| unsafe { super::compose(&parsed, format.timezone) })
+            .map_or(std::ptr::null_mut(), crate::timer::date_since_1970)
+    }
+
     unsafe extern "C" fn string_from_date(receiver: Id, _sel: Sel, date: Id) -> Id {
         // SAFETY: a formatter.
         let Some(format) = (unsafe { format(receiver) }) else {
@@ -717,7 +976,277 @@ mod objc_api {
             "setTimeStyle:" => set_time_style, c"v24@0:8Q16";
             "timeStyle" => time_style, c"Q16@0:8";
             "setLocale:" => set_locale, c"v24@0:8@16";
+            "setCalendar:" => set_calendar, c"v24@0:8@16";
+            "calendar" => calendar, c"@16@0:8";
             "stringFromDate:" => string_from_date, c"@24@0:8@16";
+            "dateFromString:" => date_from_string, c"@24@0:8@16";
+        });
+        super::calendar_api::install();
+    }
+}
+
+/// `NSCalendar`'s Objective-C interface, and the `NSDateComponents` it
+/// answers with.
+mod calendar_api {
+    use objc::object::Id;
+    use objc::sel::Sel;
+
+    use super::{CFTypeRef, Calendar, calendar_class, contents};
+
+    /// `NSDateComponentUndefined`.
+    const UNDEFINED: i64 = i64::MAX;
+
+    /// `NSCalendarUnit`, the units a difference is asked in.
+    mod unit {
+        pub const YEAR: u64 = 1 << 2;
+        pub const MONTH: u64 = 1 << 3;
+        pub const DAY: u64 = 1 << 4;
+        pub const HOUR: u64 = 1 << 5;
+        pub const MINUTE: u64 = 1 << 6;
+        pub const SECOND: u64 = 1 << 7;
+        pub const SUPPORTED: u64 = YEAR | MONTH | DAY | HOUR | MINUTE | SECOND;
+    }
+
+    const SECONDS_PER_DAY: i64 = 86_400;
+
+    struct Components {
+        year: i64,
+        month: i64,
+        day: i64,
+        hour: i64,
+        minute: i64,
+        second: i64,
+    }
+
+    impl Default for Components {
+        fn default() -> Self {
+            Self {
+                year: UNDEFINED,
+                month: UNDEFINED,
+                day: UNDEFINED,
+                hour: UNDEFINED,
+                minute: UNDEFINED,
+                second: UNDEFINED,
+            }
+        }
+    }
+
+    fn components_class() -> &'static objc::class::Class {
+        crate::boxed::register::<Components>(c"NSDateComponents", None)
+    }
+
+    /// # Safety
+    ///
+    /// `object` is null or an object this runtime allocated.
+    unsafe fn components<'a>(object: Id) -> Option<&'a mut Components> {
+        unsafe { crate::boxed::contents::<Components>(object, components_class()) }
+    }
+
+    unsafe extern "C" fn components_init(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: an instance of the class registered for `Components`.
+        unsafe { crate::boxed::fill(receiver, Components::default()) };
+        receiver
+    }
+
+    macro_rules! field {
+        ($get:ident, $set:ident, $field:ident) => {
+            unsafe extern "C" fn $get(receiver: Id, _sel: Sel) -> i64 {
+                // SAFETY: a date components object.
+                unsafe { components(receiver) }.map_or(UNDEFINED, |c| c.$field)
+            }
+            unsafe extern "C" fn $set(receiver: Id, _sel: Sel, value: i64) {
+                // SAFETY: a date components object.
+                if let Some(c) = unsafe { components(receiver) } {
+                    c.$field = value;
+                }
+            }
+        };
+    }
+    field!(year, set_year, year);
+    field!(month, set_month, month);
+    field!(day, set_day, day);
+    field!(hour, set_hour, hour);
+    field!(minute, set_minute, minute);
+    field!(second, set_second, second);
+
+    /// `-initWithCalendarIdentifier:` on the placeholder `+alloc` made from the
+    /// abstract class, which the concrete calendar replaces.
+    unsafe extern "C" fn init_with_identifier(receiver: Id, _sel: Sel, identifier: Id) -> Id {
+        objc::arc::release(receiver);
+        // SAFETY: a string or nil.
+        unsafe { super::cf::create_calendar(identifier as CFTypeRef) as Id }
+    }
+
+    unsafe extern "C" fn calendar_with_identifier(_class: Id, _sel: Sel, identifier: Id) -> Id {
+        // SAFETY: a string or nil.
+        let calendar = unsafe { super::cf::create_calendar(identifier as CFTypeRef) } as Id;
+        objc::arc::autorelease(calendar)
+    }
+
+    /// # Safety
+    ///
+    /// `object` is null or an object this runtime allocated.
+    unsafe fn calendar<'a>(object: Id) -> Option<&'a mut Calendar> {
+        unsafe { contents::<Calendar>(object as CFTypeRef, calendar_class()) }
+    }
+
+    /// `-setLocale:`, which decides the day a week starts on by the locale's
+    /// region. The arithmetic is Gregorian whatever the locale.
+    unsafe extern "C" fn set_locale(receiver: Id, _sel: Sel, locale: Id) {
+        // SAFETY: a calendar.
+        let Some(calendar) = (unsafe { calendar(receiver) }) else {
+            return;
+        };
+        if locale.is_null() {
+            return;
+        }
+        // SAFETY: `-countryCode` is `id (id, SEL)` on any locale.
+        let country = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            crate::string::bytes(f(locale, objc::sel::get("countryCode")))
+        };
+        if let Ok(country) = std::str::from_utf8(&country)
+            && !country.is_empty()
+        {
+            calendar.first_weekday = super::first_weekday(country);
+        }
+    }
+
+    unsafe extern "C" fn set_time_zone(receiver: Id, _sel: Sel, timezone: Id) {
+        // SAFETY: a calendar.
+        if let Some(calendar) = unsafe { calendar(receiver) } {
+            let held = objc::arc::retain(timezone) as CFTypeRef;
+            objc::arc::release(calendar.timezone as Id);
+            calendar.timezone = held;
+        }
+    }
+
+    unsafe extern "C" fn time_zone(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: a calendar.
+        unsafe { calendar(receiver) }.map_or(std::ptr::null_mut(), |c| c.timezone as Id)
+    }
+
+    /// The wall-clock seconds of `date` in the calendar's zone, as Unix time.
+    ///
+    /// # Safety
+    ///
+    /// `calendar` is a calendar.
+    unsafe fn wall(calendar: &Calendar, date: Id) -> Option<f64> {
+        let when = crate::timer::interval_since_1970(date)?;
+        // SAFETY: the zone the calendar retained.
+        Some(when + unsafe { super::offset_at(calendar.timezone, when) } as f64)
+    }
+
+    /// `(days since 1970, seconds into that day)` of a wall-clock time.
+    fn split(wall: f64) -> (i64, f64) {
+        let days = (wall / SECONDS_PER_DAY as f64).floor() as i64;
+        (days, wall - (days * SECONDS_PER_DAY) as f64)
+    }
+
+    /// `-components:fromDate:toDate:options:`: the difference between two
+    /// dates in the units asked for, largest first, each in the calendar's
+    /// zone. Only years, months, days, hours, minutes and seconds are asked
+    /// of it; another unit is refused by name.
+    unsafe extern "C" fn components_between(
+        receiver: Id,
+        _sel: Sel,
+        units: u64,
+        from: Id,
+        to: Id,
+        _options: u64,
+    ) -> Id {
+        if units & !unit::SUPPORTED != 0 {
+            objc::fail!(
+                "-[NSCalendar components:fromDate:toDate:options:]: the units {:#x} are not \
+                 implemented",
+                units & !unit::SUPPORTED
+            );
+        }
+        // SAFETY: a calendar, and two dates.
+        let Some(calendar) = (unsafe { calendar(receiver) }) else {
+            return std::ptr::null_mut();
+        };
+        let (Some(start), Some(end)) = (unsafe { wall(calendar, from) }, unsafe {
+            wall(calendar, to)
+        }) else {
+            return std::ptr::null_mut();
+        };
+        let sign: i64 = if end >= start { 1 } else { -1 };
+        let (low, high) = if sign > 0 { (start, end) } else { (end, start) };
+        let mut result = Components::default();
+
+        // Whole months first, as the calendar counts them: a month is not a
+        // fixed number of seconds.
+        let mut cursor = low;
+        if units & (unit::YEAR | unit::MONTH) != 0 {
+            let ((low_day, low_time), (high_day, high_time)) = (split(low), split(high));
+            let (ly, lm, ld) = super::civil_from_days(low_day);
+            let (hy, hm, hd) = super::civil_from_days(high_day);
+            let mut months = (hy - ly) * 12 + (hm - lm);
+            if (hd, high_time) < (ld, low_time) {
+                months -= 1;
+            }
+            let years = match units & unit::YEAR != 0 {
+                true => months / 12,
+                false => 0,
+            };
+            let counted = match units & unit::MONTH != 0 {
+                true => months,
+                false => years * 12,
+            };
+            if units & unit::YEAR != 0 {
+                result.year = sign * years;
+            }
+            if units & unit::MONTH != 0 {
+                result.month = sign * (months - years * 12);
+            }
+            let total = lm - 1 + counted;
+            let (year, month) = (ly + total.div_euclid(12), total.rem_euclid(12) + 1);
+            let day = ld.min(super::days_in_month(year, month));
+            cursor = (super::days_from_civil(year, month, day) * SECONDS_PER_DAY) as f64 + low_time;
+        }
+        let mut remaining = (high - cursor).floor() as i64;
+        for (bit, size, field) in [
+            (unit::DAY, SECONDS_PER_DAY, &mut result.day),
+            (unit::HOUR, 3600, &mut result.hour),
+            (unit::MINUTE, 60, &mut result.minute),
+            (unit::SECOND, 1, &mut result.second),
+        ] {
+            if units & bit != 0 {
+                *field = sign * (remaining / size);
+                remaining %= size;
+            }
+        }
+        objc::arc::autorelease(crate::boxed::make(components_class(), result))
+    }
+
+    pub(super) fn install() {
+        let components = components_class();
+        crate::define::methods!(components, {
+            "init" => components_init, c"@16@0:8";
+            "year" => year, c"q16@0:8";
+            "setYear:" => set_year, c"v24@0:8q16";
+            "month" => month, c"q16@0:8";
+            "setMonth:" => set_month, c"v24@0:8q16";
+            "day" => day, c"q16@0:8";
+            "setDay:" => set_day, c"v24@0:8q16";
+            "hour" => hour, c"q16@0:8";
+            "setHour:" => set_hour, c"v24@0:8q16";
+            "minute" => minute, c"q16@0:8";
+            "setMinute:" => set_minute, c"v24@0:8q16";
+            "second" => second, c"q16@0:8";
+            "setSecond:" => set_second, c"v24@0:8q16";
+        });
+        let calendar = objc::class::lookup(c"NSCalendar").expect("registered by calendar_class");
+        crate::define::class_methods!(calendar, {
+            "calendarWithIdentifier:" => calendar_with_identifier, c"@24@0:8@16";
+        });
+        crate::define::methods!(calendar, {
+            "initWithCalendarIdentifier:" => init_with_identifier, c"@24@0:8@16";
+            "setLocale:" => set_locale, c"v24@0:8@16";
+            "setTimeZone:" => set_time_zone, c"v24@0:8@16";
+            "timeZone" => time_zone, c"@16@0:8";
+            "components:fromDate:toDate:options:" => components_between, c"@48@0:8Q16@24@32Q40";
         });
     }
 }
@@ -1393,10 +1922,22 @@ pub mod cf {
         _allocator: CFTypeRef,
         identifier: CFTypeRef,
     ) -> CFTypeRef {
-        let Some(text) = (unsafe { corefoundation::string::as_string(identifier) }) else {
+        // SAFETY: the caller's guarantee.
+        unsafe { create_calendar(identifier) }
+    }
+
+    /// A calendar for `identifier`, owned by the caller.
+    ///
+    /// # Safety
+    ///
+    /// `identifier` is null or a string.
+    pub(super) unsafe fn create_calendar(identifier: CFTypeRef) -> CFTypeRef {
+        if identifier.is_null() {
             return std::ptr::null();
-        };
-        let text = String::from_utf8_lossy(&text.utf8()).into_owned();
+        }
+        // SAFETY: a string.
+        let text = String::from_utf8_lossy(&unsafe { crate::string::bytes(identifier as Id) })
+            .into_owned();
         if text != "gregorian" && text != "iso8601" {
             objc::fail!(
                 "CFCalendarCreateWithIdentifier: {text} is a calendar this runtime does not \

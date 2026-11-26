@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use objc::class::Class;
 use objc::object::Id;
@@ -41,6 +41,16 @@ struct Progress {
     completion: usize,
     executing: bool,
     finished: bool,
+    /// Retained operations that must finish before this one is ready.
+    dependencies: Vec<usize>,
+    /// Queues holding an operation that depends on this one, told when it
+    /// finishes so they look for work again.
+    waiters: Vec<Weak<Queue>>,
+    /// The queue this operation was added to, told when it is cancelled: a
+    /// cancelled operation is ready whatever its dependencies say.
+    queue: Option<Weak<Queue>>,
+    /// `NSOperationQueuePriority`.
+    priority: i64,
 }
 
 // SAFETY: the blocks are heap copies this module owns, and every runtime they
@@ -53,6 +63,9 @@ impl Drop for Operation {
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
         for held in state.blocks.drain(..).chain([state.completion]) {
             objc::block::release(held as Id);
+        }
+        for dependency in state.dependencies.drain(..) {
+            objc::arc::release(dependency as Id);
         }
     }
 }
@@ -132,13 +145,16 @@ unsafe extern "C" fn start(receiver: Id, _sel: Sel) {
         // SAFETY: `-main` is `void (id, SEL)`.
         unsafe { send_void(receiver, "main") };
     }
-    let completion = {
+    let (completion, waiters) = {
         let mut state = operation.state.lock().unwrap_or_else(|e| e.into_inner());
         state.executing = false;
         state.finished = true;
-        state.completion
+        (state.completion, std::mem::take(&mut state.waiters))
     };
     operation.done.notify_all();
+    for queue in waiters.iter().filter_map(Weak::upgrade) {
+        look_for_work(&queue);
+    }
     // SAFETY: a completion block is `void (^)(void)`.
     unsafe { block::call(completion as Id) };
 }
@@ -163,8 +179,18 @@ unsafe fn send_void(receiver: Id, name: &str) {
 
 unsafe extern "C" fn cancel(receiver: Id, _sel: Sel) {
     // SAFETY: a live object.
-    if let Some(operation) = unsafe { operation(receiver) } {
-        operation.cancelled.store(true, Ordering::Release);
+    let Some(operation) = (unsafe { operation(receiver) }) else {
+        return;
+    };
+    operation.cancelled.store(true, Ordering::Release);
+    let queue = operation
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .queue
+        .clone();
+    if let Some(queue) = queue.as_ref().and_then(Weak::upgrade) {
+        look_for_work(&queue);
     }
 }
 
@@ -187,10 +213,120 @@ unsafe extern "C" fn is_finished(receiver: Id, _sel: Sel) -> u8 {
         .is_some_and(|o| o.state.lock().unwrap_or_else(|e| e.into_inner()).finished) as u8
 }
 
-/// An operation with no dependencies is ready as soon as it exists, which is
-/// what this tree's queues assume when they start one.
-unsafe extern "C" fn is_ready(_receiver: Id, _sel: Sel) -> u8 {
-    1
+/// Whether the operation `object` has finished, by its own state.
+///
+/// # Safety
+///
+/// `object` must be null or an object this runtime allocated.
+unsafe fn has_finished(object: usize) -> bool {
+    unsafe { operation(object as Id) }
+        .is_none_or(|o| o.state.lock().unwrap_or_else(|e| e.into_inner()).finished)
+}
+
+/// Ready once every dependency has finished, or once it is cancelled: a
+/// cancelled operation still has to start, to finish.
+///
+/// FIXME (ACCURACY): a dependency's own `finished` state is read rather than
+/// its `-isFinished` sent, so a subclass that overrides `-isFinished` without
+/// finishing through `-start` is not waited for correctly.
+///
+/// # Safety
+///
+/// `object` must be null or an object this runtime allocated.
+unsafe fn ready(object: usize) -> bool {
+    // SAFETY: the caller's guarantee.
+    let Some(operation) = (unsafe { operation(object as Id) }) else {
+        return true;
+    };
+    if operation.cancelled.load(Ordering::Acquire) {
+        return true;
+    }
+    let dependencies = operation
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .dependencies
+        .clone();
+    // SAFETY: each is a retained operation.
+    dependencies.iter().all(|d| unsafe { has_finished(*d) })
+}
+
+unsafe extern "C" fn is_ready(receiver: Id, _sel: Sel) -> u8 {
+    // SAFETY: a live object.
+    unsafe { ready(receiver as usize) as u8 }
+}
+
+unsafe extern "C" fn add_dependency(receiver: Id, _sel: Sel, dependency: Id) {
+    // SAFETY: a live object.
+    let Some(operation) = (unsafe { operation(receiver) }) else {
+        return;
+    };
+    if dependency.is_null() {
+        return;
+    }
+    let mut state = operation.state.lock().unwrap_or_else(|e| e.into_inner());
+    if !state.dependencies.contains(&(dependency as usize)) {
+        state
+            .dependencies
+            .push(objc::arc::retain(dependency) as usize);
+    }
+}
+
+unsafe extern "C" fn remove_dependency(receiver: Id, _sel: Sel, dependency: Id) {
+    // SAFETY: a live object.
+    let Some(operation) = (unsafe { operation(receiver) }) else {
+        return;
+    };
+    let removed = {
+        let mut state = operation.state.lock().unwrap_or_else(|e| e.into_inner());
+        let at = state
+            .dependencies
+            .iter()
+            .position(|d| *d == dependency as usize);
+        at.map(|at| (state.dependencies.remove(at), state.queue.clone()))
+    };
+    let Some((removed, queue)) = removed else {
+        return;
+    };
+    objc::arc::release(removed as Id);
+    if let Some(queue) = queue.as_ref().and_then(Weak::upgrade) {
+        look_for_work(&queue);
+    }
+}
+
+unsafe extern "C" fn dependencies(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a live object.
+    let held: Vec<corefoundation::base::CFTypeRef> = unsafe { operation(receiver) }
+        .map(|o| {
+            let state = o.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.dependencies.iter().map(|d| *d as _).collect()
+        })
+        .unwrap_or_default();
+    let array = corefoundation::collections::new_array(
+        &held,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: a fresh object.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+unsafe extern "C" fn queue_priority(receiver: Id, _sel: Sel) -> i64 {
+    // SAFETY: a live object.
+    unsafe { operation(receiver) }.map_or(0, |o| {
+        o.state.lock().unwrap_or_else(|e| e.into_inner()).priority
+    })
+}
+
+unsafe extern "C" fn set_queue_priority(receiver: Id, _sel: Sel, priority: i64) {
+    // SAFETY: a live object.
+    if let Some(operation) = unsafe { operation(receiver) } {
+        operation
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .priority = priority;
+    }
 }
 
 unsafe extern "C" fn is_concurrent(_receiver: Id, _sel: Sel) -> u8 {
@@ -336,14 +472,35 @@ impl Pending {
         }
     }
 
-    /// The next operation to run, if the queue is allowed to start one.
+    /// The next operation to run, if the queue is allowed to start one: the
+    /// highest-priority ready one, the earliest added among equals.
     fn next(&mut self) -> Option<usize> {
         if self.suspended || self.running >= self.width() {
             return None;
         }
-        let operation = self.operations.pop_front()?;
+        let at = self
+            .ready()
+            .max_by_key(|&(at, operation)| {
+                // SAFETY: a retained operation.
+                (
+                    unsafe { queue_priority(operation as Id, objc::sel::get("queuePriority")) },
+                    std::cmp::Reverse(at),
+                )
+            })?
+            .0;
+        let operation = self.operations.remove(at)?;
         self.running += 1;
         Some(operation)
+    }
+
+    /// The queued operations that are ready, with where each is.
+    fn ready(&self) -> impl Iterator<Item = (usize, usize)> {
+        self.operations
+            .iter()
+            .copied()
+            .enumerate()
+            // SAFETY: each is a retained operation.
+            .filter(|&(_, operation)| unsafe { ready(operation) })
     }
 }
 
@@ -444,9 +601,21 @@ unsafe extern "C" fn drain_main(info: *mut std::ffi::c_void) {
     }
     // Anything left over - the queue is at its width, or an operation added
     // one - is for the next turn, which has to be asked for.
+    // One waiting on a dependency is not: the dependency's finishing asks.
     let pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
-    if !pending.operations.is_empty() {
+    if pending.ready().next().is_some() {
         signal_main(state);
+    }
+}
+
+/// Have `state` start whatever it now can.
+fn look_for_work(state: &Arc<Queue>) {
+    match state.main {
+        true => signal_main(state),
+        false => {
+            state.work.notify_all();
+            start_worker(state);
+        }
     }
 }
 
@@ -503,6 +672,24 @@ fn enqueue(receiver: Id, operation: Id) {
         return;
     };
     objc::arc::retain(receiver);
+    // SAFETY: a live object.
+    if let Some(queued) = unsafe { self::operation(operation) } {
+        let dependencies = {
+            let mut own = queued.state.lock().unwrap_or_else(|e| e.into_inner());
+            own.queue = Some(Arc::downgrade(&state));
+            own.dependencies.clone()
+        };
+        for dependency in dependencies {
+            // SAFETY: a retained operation.
+            let Some(dependency) = (unsafe { self::operation(dependency as Id) }) else {
+                continue;
+            };
+            let mut theirs = dependency.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !theirs.finished {
+                theirs.waiters.push(Arc::downgrade(&state));
+            }
+        }
+    }
     {
         let mut pending = state.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending
@@ -747,6 +934,11 @@ pub(crate) fn install() {
         "isExecuting" => is_executing, c"B16@0:8";
         "isFinished" => is_finished, c"B16@0:8";
         "isReady" => is_ready, c"B16@0:8";
+        "addDependency:" => add_dependency, c"v24@0:8@16";
+        "removeDependency:" => remove_dependency, c"v24@0:8@16";
+        "dependencies" => dependencies, c"@16@0:8";
+        "queuePriority" => queue_priority, c"q16@0:8";
+        "setQueuePriority:" => set_queue_priority, c"v24@0:8q16";
         "isConcurrent" => is_concurrent, c"B16@0:8";
         "isAsynchronous" => is_concurrent, c"B16@0:8";
         "waitUntilFinished" => wait_until_finished, c"v16@0:8";
@@ -886,6 +1078,41 @@ mod tests {
             wait_until_all_finished(queue, objc::sel::get("waitUntilAllOperationsAreFinished"));
         }
         assert_eq!(OVERLAPPED.load(Ordering::SeqCst), 0, "two ran at once");
+        objc::arc::release(queue);
+    }
+
+    /// The order the two operations below ran in, as their tags.
+    static ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn first(_block: Id) {
+        ORDER.lock().unwrap_or_else(|e| e.into_inner()).push(1);
+    }
+
+    unsafe extern "C" fn second(_block: Id) {
+        ORDER.lock().unwrap_or_else(|e| e.into_inner()).push(2);
+    }
+
+    /// An operation waits for its dependency, even when it was queued first
+    /// on a queue that could run both at once.
+    #[test]
+    fn an_operation_runs_after_its_dependency() {
+        let queue = new_object(c"NSOperationQueue");
+        ORDER.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let (a, b) = (
+            fake::block(first as *const std::ffi::c_void),
+            fake::block(second as *const std::ffi::c_void),
+        );
+        let (earlier, later) = (block_operation(a.id()), block_operation(b.id()));
+        // SAFETY: each prototype is its method's.
+        unsafe {
+            add_dependency(later, objc::sel::get("addDependency:"), earlier);
+            assert_eq!(is_ready(later, objc::sel::get("isReady")), 0);
+            add_operation(queue, objc::sel::get("addOperation:"), later);
+            add_operation(queue, objc::sel::get("addOperation:"), earlier);
+            wait_until_all_finished(queue, objc::sel::get("waitUntilAllOperationsAreFinished"));
+            assert_eq!(is_ready(later, objc::sel::get("isReady")), 1);
+        }
+        assert_eq!(*ORDER.lock().unwrap_or_else(|e| e.into_inner()), [1, 2]);
         objc::arc::release(queue);
     }
 

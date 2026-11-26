@@ -32,6 +32,7 @@ pub mod json;
 pub mod kvc;
 pub mod kvo;
 pub mod locale;
+mod maptable;
 pub mod notification;
 pub mod objectify;
 pub mod operation;
@@ -125,6 +126,7 @@ exports::group! {
     runtime,
     calculate,
     locale::cf,
+    maptable,
     formatter::cf,
     timer::cf,
     appleevent,
@@ -252,6 +254,9 @@ fn declare_abstract() {
     for name in [c"NSFormatter", c"NSLock", c"NSRecursiveLock"] {
         corefoundation::base::abstract_class(name, None);
     }
+    // Not subclassed, but looked up by name: a bridge wraps CoreFoundation
+    // objects that have no Foundation class of their own as this one.
+    corefoundation::base::abstract_class(c"NSCFType", None);
 }
 
 /// Every class this crate answers for.
@@ -317,6 +322,8 @@ pub const CLASSES: &[&str] = &[
     "NSProcessInfo",
     "NSDateFormatter",
     "NSNumberFormatter",
+    "NSCalendar",
+    "NSDateComponents",
     "NSFileHandle",
     "NSPipe",
     "NSTask",
@@ -360,6 +367,8 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     out.push(("_NSZeroPoint".to_string(), zeroed::<geometry::NSPoint>()));
     out.push(("_NSZeroSize".to_string(), zeroed::<geometry::NSSize>()));
     out.push(("_NSZeroRect".to_string(), zeroed::<geometry::NSRect>()));
+    // `{top, left, bottom, right}`, four doubles.
+    out.push(("_NSEdgeInsetsZero".to_string(), zeroed::<[f64; 4]>()));
     // The CoreGraphics spellings of the same three, which are separate symbols
     // in a separate framework's `__DATA` even though the types are identical.
     out.push(("_CGPointZero".to_string(), zeroed::<geometry::NSPoint>()));
@@ -412,6 +421,11 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSURLTypeIdentifierKey", "NSURLTypeIdentifierKey"),
     ("_NSArgumentDomain", "NSArgumentDomain"),
     ("_NSGlobalDomain", "NSGlobalDomain"),
+    ("_NSFileSize", "NSFileSize"),
+    ("_NSFileType", "NSFileType"),
+    ("_NSFileModificationDate", "NSFileModificationDate"),
+    ("_NSFileOwnerAccountID", "NSFileOwnerAccountID"),
+    ("_NSFileGroupOwnerAccountID", "NSFileGroupOwnerAccountID"),
     ("_NSFilePosixPermissions", "NSFilePosixPermissions"),
     ("_NSFileImmutable", "NSFileImmutable"),
     ("_NSFileSystemFreeSize", "NSFileSystemFreeSize"),
@@ -455,6 +469,12 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // against a newer SDK binds them there.
     ("_NSGenericException", "NSGenericException"),
     ("_NSInvalidArgumentException", "NSInvalidArgumentException"),
+    (
+        "_NSInternalInconsistencyException",
+        "NSInternalInconsistencyException",
+    ),
+    // The name an unknown key's exception carries, which is not the symbol's.
+    ("_NSUndefinedKeyException", "NSUnknownKeyException"),
     ("_NSNegateBooleanTransformerName", "NSNegateBoolean"),
     ("_NSIsNilTransformerName", "NSIsNil"),
     ("_NSIsNotNilTransformerName", "NSIsNotNil"),
@@ -482,6 +502,12 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     thread::WILL_BECOME_MULTI_THREADED,
     thread::DID_BECOME_SINGLE_THREADED,
     thread::WILL_EXIT,
+    // Observed by a program that waits on its tasks and pipes. Nothing posts
+    // them yet: `NSTask` does not watch for exits and `NSFileHandle` has no
+    // background reads.
+    "NSTaskDidTerminateNotification",
+    "NSFileHandleReadToEndOfFileCompletionNotification",
+    "NSFileHandleConnectionAcceptedNotification",
 ];
 
 #[cfg(test)]

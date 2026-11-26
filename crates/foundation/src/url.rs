@@ -1008,6 +1008,84 @@ const IS_ALIAS: u16 = 0x8000;
 /// The first word of bookmark data.
 const BOOKMARK_MAGIC: &[u8] = b"book";
 
+/// `-bookmarkDataWithOptions:includingResourceValuesForKeys:relativeToURL:error:`,
+/// `CFURLCreateBookmarkData`'s Foundation spelling.
+unsafe extern "C" fn bookmark_data_with_options(
+    receiver: Id,
+    _sel: Sel,
+    options: u64,
+    keys: Id,
+    relative_to: Id,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: a URL, and the caller's arguments passed through.
+    let data = unsafe {
+        corefoundation::api::CFURLCreateBookmarkData(
+            std::ptr::null(),
+            receiver as corefoundation::base::CFTypeRef,
+            options,
+            keys as corefoundation::base::CFTypeRef,
+            relative_to as corefoundation::base::CFTypeRef,
+            std::ptr::null_mut(),
+        )
+    };
+    if data.is_null() {
+        if !error.is_null() {
+            // SAFETY: the caller's `NSError **`.
+            unsafe {
+                *error = crate::error::make(
+                    "NSCocoaErrorDomain",
+                    FILE_READ_NO_SUCH_FILE,
+                    "The file couldn\u{2019}t be opened because there is no such file.",
+                )
+            };
+        }
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a fresh object.
+    unsafe { corefoundation::api::CFAutorelease(data) as Id }
+}
+
+/// `+URLByResolvingBookmarkData:options:relativeToURL:bookmarkDataIsStale:error:`,
+/// `CFURLCreateByResolvingBookmarkData`'s Foundation spelling.
+unsafe extern "C" fn url_by_resolving_bookmark_data(
+    _class: Id,
+    _sel: Sel,
+    bookmark: Id,
+    options: u64,
+    relative_to: Id,
+    is_stale: *mut u8,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: data and a URL or nil, and the caller's out-parameter.
+    let url = unsafe {
+        corefoundation::api::CFURLCreateByResolvingBookmarkData(
+            std::ptr::null(),
+            bookmark as corefoundation::base::CFTypeRef,
+            options,
+            relative_to as corefoundation::base::CFTypeRef,
+            std::ptr::null(),
+            is_stale,
+            std::ptr::null_mut(),
+        )
+    };
+    if url.is_null() {
+        if !error.is_null() {
+            // SAFETY: the caller's `NSError **`.
+            unsafe {
+                *error = crate::error::make(
+                    "NSCocoaErrorDomain",
+                    FILE_READ_NO_SUCH_FILE,
+                    "The file couldn\u{2019}t be opened because there is no such file.",
+                )
+            };
+        }
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a fresh object.
+    unsafe { corefoundation::api::CFAutorelease(url) as Id }
+}
+
 /// `+bookmarkDataWithContentsOfURL:error:`: the bookmark an alias file holds.
 ///
 /// A Finder alias is a file flagged as one whose contents are its bookmark.
@@ -1099,8 +1177,12 @@ pub(crate) fn install() {
         "URLWithString:relativeToURL:" => url_with_string_relative_to_url, c"@32@0:8@16@24";
         "bookmarkDataWithContentsOfURL:error:" => bookmark_data_with_contents_of_url,
             c"@32@0:8@16^@24";
+        "URLByResolvingBookmarkData:options:relativeToURL:bookmarkDataIsStale:error:"
+            => url_by_resolving_bookmark_data, c"@56@0:8@16Q24@32^c40^@48";
     });
     methods!(abstract_class, {
+        "bookmarkDataWithOptions:includingResourceValuesForKeys:relativeToURL:error:"
+            => bookmark_data_with_options, c"@48@0:8Q16@24@32^@40";
         "initWithString:" => init_with_string, c"@24@0:8@16";
         "initWithString:relativeToURL:" => init_with_string_relative_to_url, c"@32@0:8@16@24";
         "initFileURLWithPath:relativeToURL:" => init_file_url_with_path_relative_to_url,

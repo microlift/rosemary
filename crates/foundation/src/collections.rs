@@ -57,11 +57,39 @@ unsafe extern "C" fn array_by_adding_object(receiver: Id, _sel: Sel, object: Id)
     unsafe { array_adding(receiver, &[object as CFTypeRef]) }
 }
 
+/// The elements of an `NSArray`: its own storage when it is one of this
+/// runtime's, and otherwise what `-count` and `-objectAtIndex:` answer - the
+/// two methods every subclass implements, which is how a bridge's proxy for its
+/// language's lists is read. `None` for anything that is not an array.
+///
+/// # Safety
+///
+/// `array` is null or a live object.
+pub(crate) unsafe fn elements_of(array: Id) -> Option<Vec<CFTypeRef>> {
+    // SAFETY: the caller's guarantee.
+    if let Some(own) = unsafe { collections::array(array as CFTypeRef) } {
+        return Some(own.values.clone());
+    }
+    let class = objc::class::lookup(c"NSArray")?;
+    // SAFETY: the caller's guarantee.
+    if array.is_null() || !unsafe { corefoundation::base::is_kind_of(array as _, class) } {
+        return None;
+    }
+    // SAFETY: `-count` is `NSUInteger (id, SEL)` and `-objectAtIndex:` is
+    // `id (id, SEL, NSUInteger)`, on any `NSArray`.
+    unsafe {
+        let count: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc::msg::entry());
+        let at: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let n = count(array, objc::sel::get("count"));
+        let sel = objc::sel::get("objectAtIndex:");
+        Some((0..n).map(|i| at(array, sel, i) as CFTypeRef).collect())
+    }
+}
+
 unsafe extern "C" fn array_by_adding_objects(receiver: Id, _sel: Sel, other: Id) -> Id {
     // SAFETY: an array, and an array or nil.
-    let extra = unsafe { collections::array(other as CFTypeRef) }
-        .map(|a| a.values.clone())
-        .unwrap_or_default();
+    let extra = unsafe { elements_of(other) }.unwrap_or_default();
     // SAFETY: an array.
     unsafe { array_adding(receiver, &extra) }
 }
@@ -445,8 +473,8 @@ unsafe extern "C" fn add_objects_from_array(receiver: Id, _sel: Sel, other: Id) 
     }
     // Cloned first: an array may be asked to add its own contents.
     // SAFETY: the argument is an array if it is one of ours.
-    let values = match unsafe { collections::array(other as CFTypeRef) } {
-        Some(o) => o.values.clone(),
+    let values = match unsafe { elements_of(other) } {
+        Some(values) => values,
         None => objc::fail!("-[NSMutableArray addObjectsFromArray:]: the argument is not an array"),
     };
     for value in values {
@@ -1199,8 +1227,8 @@ unsafe extern "C" fn set_array(receiver: Id, _sel: Sel, other: Id) {
     let values = match other.is_null() {
         true => Vec::new(),
         // SAFETY: the argument is an array if it is one of ours.
-        false => match unsafe { collections::array(other as CFTypeRef) } {
-            Some(o) => o.values.clone(),
+        false => match unsafe { elements_of(other) } {
+            Some(values) => values,
             None => objc::fail!("-[NSMutableArray setArray:]: the argument is not an array"),
         },
     };
@@ -1376,8 +1404,8 @@ unsafe extern "C" fn array_with_array(_class: Id, _sel: Sel, other: Id) -> Id {
         Vec::new()
     } else {
         // SAFETY: the argument is an array if it is one of ours.
-        match unsafe { collections::array(other as CFTypeRef) } {
-            Some(a) => a.values.clone(),
+        match unsafe { elements_of(other) } {
+            Some(values) => values,
             None => objc::fail!("+[NSMutableArray arrayWithArray:]: the argument is not an array"),
         }
     };
@@ -1797,14 +1825,30 @@ unsafe extern "C" fn dictionary_mutable_copy_with_zone(
 /// never fills. Apple's clusters substitute here too, which is why `-init` is
 /// documented there as returning "an object other than the receiver".
 ///
+/// Only an instance of the abstract class `cluster` itself is a placeholder. A
+/// subclass's instance is the subclass's own object - its `[super init]`
+/// answers itself, as on a Mac - and the subclass keeps its state in it.
+///
 /// # Safety
 ///
 /// `receiver` is null or an instance of the class this was installed on, and
 /// `concrete` answers a fresh object with one reference.
-unsafe fn cluster_init(receiver: Id, known: bool, concrete: impl FnOnce() -> CFTypeRef) -> Id {
+unsafe fn cluster_init(
+    receiver: Id,
+    known: bool,
+    cluster: &std::ffi::CStr,
+    concrete: impl FnOnce() -> CFTypeRef,
+) -> Id {
     if receiver.is_null() || known {
         // Already concrete: `-init` on one of those is the identity, and
         // replacing it would throw away contents the caller just made.
+        return receiver;
+    }
+    // SAFETY: a live object.
+    let class = unsafe { objc::object::class_of(receiver) };
+    if !class
+        .is_some_and(|class| objc::class::lookup(cluster).is_some_and(|c| std::ptr::eq(c, class)))
+    {
         return receiver;
     }
     let object = concrete() as Id;
@@ -1819,7 +1863,7 @@ unsafe extern "C" fn init_mutable_array(receiver: Id, _sel: Sel) -> Id {
     let known = unsafe { collections::array(receiver as CFTypeRef) }.is_some();
     // SAFETY: as above, with a fresh empty array.
     unsafe {
-        cluster_init(receiver, known, || {
+        cluster_init(receiver, known, c"NSMutableArray", || {
             collections::new_array(&[], Policy::from_type_callbacks(), true)
         })
     }
@@ -1839,7 +1883,7 @@ unsafe extern "C" fn init_mutable_dictionary(receiver: Id, _sel: Sel) -> Id {
     let known = unsafe { collections::dictionary(receiver as CFTypeRef) }.is_some();
     // SAFETY: as above, with a fresh empty dictionary.
     unsafe {
-        cluster_init(receiver, known, || {
+        cluster_init(receiver, known, c"NSMutableDictionary", || {
             collections::new_dictionary(
                 &[],
                 Policy::from_key_callbacks(),
@@ -2594,7 +2638,7 @@ unsafe extern "C" fn init_mutable_set_with_capacity(
     let known = unsafe { collections::set(receiver as CFTypeRef) }.is_some();
     // SAFETY: as above, with a fresh empty set.
     unsafe {
-        cluster_init(receiver, known, || {
+        cluster_init(receiver, known, c"NSMutableSet", || {
             collections::new_set(&[], Policy::from_type_callbacks())
         })
     }
@@ -2602,11 +2646,11 @@ unsafe extern "C" fn init_mutable_set_with_capacity(
 
 unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
     // SAFETY: the argument is an NSArray or nil.
-    let values = unsafe { collections::array(array as CFTypeRef) }
-        .map(|array| array.values.as_slice())
-        .unwrap_or(&[]);
+    let values = unsafe { elements_of(array) }.unwrap_or_default();
     // SAFETY: the new set retains its elements.
-    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(&values, Policy::from_type_callbacks())) as Id
+    }
 }
 
 /// `+setWithObjects:count:`, which the nil-terminated `+setWithObjects:` is
@@ -2745,9 +2789,7 @@ unsafe fn members_of(collection: Id) -> Vec<CFTypeRef> {
         if let Some(set) = collections::set(collection as CFTypeRef) {
             return set.values().to_vec();
         }
-        collections::array(collection as CFTypeRef)
-            .map(|array| array.values.clone())
-            .unwrap_or_default()
+        elements_of(collection).unwrap_or_default()
     }
 }
 

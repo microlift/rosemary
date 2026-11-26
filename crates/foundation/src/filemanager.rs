@@ -1107,6 +1107,25 @@ unsafe extern "C" fn string_with_file_system_representation(
     }
 }
 
+/// `-fileSystemRepresentationWithPath:`, which is the path's own
+/// `-fileSystemRepresentation`.
+unsafe extern "C" fn file_system_representation_with_path(
+    _receiver: Id,
+    _sel: Sel,
+    path: Id,
+) -> *const std::ffi::c_char {
+    if path.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: `-fileSystemRepresentation` is `const char * (id, SEL)`, and
+    // `path` is a live string.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char =
+            std::mem::transmute(objc::msg::entry());
+        f(path, objc::sel::get("fileSystemRepresentation"))
+    }
+}
+
 unsafe extern "C" fn is_writable(_receiver: Id, _sel: Sel, path: Id) -> u8 {
     // SAFETY: an `NSString`, or nil.
     let Some(path) = (unsafe { path_of(path) }) else {
@@ -1164,6 +1183,21 @@ unsafe extern "C" fn change_current_directory(_receiver: Id, _sel: Sel, path: Id
 /// to keep its saves locally.
 unsafe extern "C" fn no_ubiquity(_receiver: Id, _sel: Sel) -> Id {
     std::ptr::null_mut()
+}
+
+/// The key a manager's delegate is associated under.
+static DELEGATE: u8 = 0;
+
+/// `-setDelegate:`, kept unretained as AppKit's managers keep theirs.
+///
+/// FIXME (ACCURACY): copies, moves and removals do not consult the delegate,
+/// which is what a delegate that answers nothing would get.
+unsafe extern "C" fn set_delegate(receiver: Id, _sel: Sel, delegate: Id) {
+    objc::arc::set_associated(receiver, &DELEGATE as *const u8 as *const _, delegate);
+}
+
+unsafe extern "C" fn delegate(receiver: Id, _sel: Sel) -> Id {
+    objc::arc::associated(receiver, &DELEGATE as *const u8 as *const _)
 }
 
 unsafe extern "C" fn no_ubiquity_container(_receiver: Id, _sel: Sel, _identifier: Id) -> Id {
@@ -1250,6 +1284,30 @@ struct DirectoryWalk {
     pending: Option<(std::path::PathBuf, String)>,
     /// How deep the name last handed out is; one for the root's own entries.
     level: usize,
+    /// What `-enumeratorAtURL:...` asked for, which `-enumeratorAtPath:` does
+    /// not.
+    options: WalkOptions,
+}
+
+/// The `NSDirectoryEnumerationOptions` a walk honours, and where it is
+/// rooted when it hands out URLs.
+#[derive(Default)]
+struct WalkOptions {
+    skips_subdirectories: bool,
+    skips_packages: bool,
+    skips_hidden: bool,
+    /// The guest's spelling of the root, when the walk hands out URLs under
+    /// it rather than relative paths.
+    urls: Option<String>,
+}
+
+/// `NSDirectoryEnumerationOptions`.
+mod enumeration {
+    pub const SKIPS_SUBDIRECTORY_DESCENDANTS: u64 = 1 << 0;
+    pub const SKIPS_PACKAGE_DESCENDANTS: u64 = 1 << 1;
+    pub const SKIPS_HIDDEN_FILES: u64 = 1 << 2;
+    pub const SUPPORTED: u64 =
+        SKIPS_SUBDIRECTORY_DESCENDANTS | SKIPS_PACKAGE_DESCENDANTS | SKIPS_HIDDEN_FILES;
 }
 
 impl DirectoryWalk {
@@ -1260,6 +1318,7 @@ impl DirectoryWalk {
             stack: vec![(root.to_path_buf(), String::new(), names.into_iter())],
             pending: None,
             level: 0,
+            options: WalkOptions::default(),
         })
     }
 
@@ -1269,7 +1328,23 @@ impl DirectoryWalk {
             stack: Vec::new(),
             pending: None,
             level: 0,
+            options: WalkOptions::default(),
         }
+    }
+
+    /// Whether the directory at `relative` is a package, which the guest's
+    /// spelling decides.
+    fn is_package(&self, relative: &str) -> bool {
+        let Some(root) = &self.options.urls else {
+            return false;
+        };
+        let guest = format!("{}/{relative}", root.trim_end_matches('/'));
+        corefoundation::urlresource::property(&guest, "NSURLIsPackageKey").is_some_and(|value| {
+            let yes = std::ptr::eq(value, corefoundation::collections::boolean(true));
+            // SAFETY: the property this call was handed.
+            unsafe { corefoundation::api::CFRelease(value) };
+            yes
+        })
     }
 
     fn skip_descendants(&mut self) {
@@ -1292,6 +1367,9 @@ impl Iterator for DirectoryWalk {
                 self.stack.pop();
                 continue;
             };
+            if self.options.skips_hidden && name.starts_with('.') {
+                continue;
+            }
             let relative = match prefix.is_empty() {
                 true => name.clone(),
                 false => format!("{prefix}/{name}"),
@@ -1299,10 +1377,12 @@ impl Iterator for DirectoryWalk {
             let child = dir.join(&name);
             // A symlink to a directory is listed but not entered, which is how
             // Apple avoids cycles.
-            if std::fs::symlink_metadata(&child).is_ok_and(|m| m.is_dir()) {
+            let enters = !self.options.skips_subdirectories
+                && std::fs::symlink_metadata(&child).is_ok_and(|m| m.is_dir());
+            self.level = self.stack.len();
+            if enters && !(self.options.skips_packages && self.is_package(&relative)) {
                 self.pending = Some((child, relative.clone()));
             }
-            self.level = self.stack.len();
             return Some(relative);
         }
     }
@@ -1332,11 +1412,62 @@ unsafe extern "C" fn enumerator_at_path(_receiver: Id, _sel: Sel, path: Id) -> I
     objc::arc::autorelease(crate::boxed::make(directory_enumerator_class(), walk))
 }
 
-/// `-nextObject`: the next path relative to the enumerated directory.
+/// `-enumeratorAtURL:includingPropertiesForKeys:options:errorHandler:`: the
+/// walk `-enumeratorAtPath:` makes, handing out URLs under `url`.
+///
+/// FIXME (ACCURACY): a directory that cannot be read is skipped, where Apple
+/// asks the error handler whether to go on; the keys are not prefetched.
+unsafe extern "C" fn enumerator_at_url(
+    _receiver: Id,
+    _sel: Sel,
+    url: Id,
+    _keys: Id,
+    options: u64,
+    _handler: Id,
+) -> Id {
+    if options & !enumeration::SUPPORTED != 0 {
+        objc::fail!(
+            "-[NSFileManager enumeratorAtURL:...]: the options {:#x} are not implemented",
+            options & !enumeration::SUPPORTED
+        );
+    }
+    // SAFETY: an `NSURL`, or nil.
+    let Some(guest) =
+        (unsafe { corefoundation::url::as_url(url as CFTypeRef) }).and_then(|u| u.file_path())
+    else {
+        return std::ptr::null_mut();
+    };
+    let mut walk = DirectoryWalk::new(&prefix::ns::existing_host_path(&guest))
+        .unwrap_or_else(DirectoryWalk::empty);
+    walk.options = WalkOptions {
+        skips_subdirectories: options & enumeration::SKIPS_SUBDIRECTORY_DESCENDANTS != 0,
+        skips_packages: options & enumeration::SKIPS_PACKAGE_DESCENDANTS != 0,
+        skips_hidden: options & enumeration::SKIPS_HIDDEN_FILES != 0,
+        urls: Some(guest),
+    };
+    objc::arc::autorelease(crate::boxed::make(directory_enumerator_class(), walk))
+}
+
+/// What a walk hands out for `relative`: the path itself, or a URL under the
+/// walk's root. Owned by the caller.
+fn walk_item(walk: &DirectoryWalk, relative: &str) -> Id {
+    let Some(root) = &walk.options.urls else {
+        return crate::string::from_str(relative);
+    };
+    let guest = format!("{}/{relative}", root.trim_end_matches('/'));
+    let directory = std::fs::metadata(prefix::ns::host_path(&guest)).is_ok_and(|m| m.is_dir());
+    corefoundation::url::new_file_url(&guest, directory) as Id
+}
+
+/// `-nextObject`: the next path relative to the enumerated directory, or the
+/// next URL under it.
 unsafe extern "C" fn directory_next_object(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a directory enumerator.
-    match unsafe { directory_walk(receiver) }.and_then(Iterator::next) {
-        Some(relative) => objc::arc::autorelease(crate::string::from_str(&relative)),
+    let Some(walk) = (unsafe { directory_walk(receiver) }) else {
+        return std::ptr::null_mut();
+    };
+    match walk.next() {
+        Some(relative) => objc::arc::autorelease(walk_item(walk, &relative)),
         None => std::ptr::null_mut(),
     }
 }
@@ -1344,11 +1475,25 @@ unsafe extern "C" fn directory_next_object(receiver: Id, _sel: Sel) -> Id {
 /// `-allObjects`: what the enumerator has not yet handed out.
 unsafe extern "C" fn directory_all_objects(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a directory enumerator.
-    let rest: Vec<String> = match unsafe { directory_walk(receiver) } {
-        Some(walk) => walk.collect(),
-        None => Vec::new(),
+    let Some(walk) = (unsafe { directory_walk(receiver) }) else {
+        return string_array(&[]);
     };
-    string_array(&rest)
+    let rest: Vec<String> = walk.by_ref().collect();
+    let items: Vec<CFTypeRef> = rest
+        .iter()
+        .map(|relative| walk_item(walk, relative) as CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &items,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for item in items {
+        // SAFETY: each is owned here and now retained by the array.
+        unsafe { corefoundation::api::CFRelease(item) };
+    }
+    // SAFETY: a fresh object.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
 /// `-skipDescendents`, and its later spelling `-skipDescendants`: do not
@@ -1514,6 +1659,8 @@ pub(crate) fn install() {
         "subpathsOfDirectoryAtPath:error:" => subpaths_of_directory, c"@32@0:8@16^@24";
         "subpathsAtPath:" => subpaths_at_path, c"@24@0:8@16";
         "enumeratorAtPath:" => enumerator_at_path, c"@24@0:8@16";
+        "enumeratorAtURL:includingPropertiesForKeys:options:errorHandler:"
+            => enumerator_at_url, c"@48@0:8@16@24Q32@?40";
         "displayNameAtPath:" => display_name, c"@24@0:8@16";
         "destinationOfSymbolicLinkAtPath:error:"
             => destination_of_symlink, c"@32@0:8@16^@24";
@@ -1532,6 +1679,8 @@ pub(crate) fn install() {
         "changeCurrentDirectoryPath:" => change_current_directory, c"B24@0:8@16";
         "stringWithFileSystemRepresentation:length:"
             => string_with_file_system_representation, c"@32@0:8*16Q24";
+        "fileSystemRepresentationWithPath:" => file_system_representation_with_path,
+            c"r*24@0:8@16";
         "createDirectoryAtURL:withIntermediateDirectories:attributes:error:"
             => create_directory_at_url, c"B44@0:8@16c24@32^@40";
         "removeItemAtURL:error:" => remove_item_at_url, c"B32@0:8@16^@24";
@@ -1545,6 +1694,8 @@ pub(crate) fn install() {
         "getRelationship:ofDirectoryAtURL:toItemAtURL:error:"
             => get_relationship, c"B48@0:8^q16@24@32^@40";
         "URLForUbiquityContainerIdentifier:" => no_ubiquity_container, c"@24@0:8@16";
+        "setDelegate:" => set_delegate, c"v24@0:8@16";
+        "delegate" => delegate, c"@16@0:8";
         "ubiquityIdentityToken" => no_ubiquity, c"@16@0:8";
     });
     methods!(directory_enumerator_class(), {
