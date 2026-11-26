@@ -395,12 +395,12 @@ pub(crate) fn install() {
 }
 
 /// The indexes `set` holds, in order, as half-open ranges.
-pub(crate) fn ranges_of(set: Id) -> Vec<(usize, usize)> {
+pub fn ranges_of(set: Id) -> Vec<(usize, usize)> {
     get(set)
 }
 
 /// A new, autoreleased immutable set of `indexes`, which need not be sorted.
-pub(crate) fn from_indexes(indexes: &[usize]) -> Id {
+pub fn from_indexes(indexes: &[usize]) -> Id {
     let mut ranges = Ranges::new();
     for &index in indexes {
         add_range(&mut ranges, index, index.saturating_add(1));

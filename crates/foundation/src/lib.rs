@@ -28,7 +28,7 @@ pub mod filemanager;
 pub mod formatter;
 pub mod geometry;
 pub mod indexpath;
-mod indexset;
+pub mod indexset;
 pub mod json;
 pub mod kvc;
 pub mod kvo;
