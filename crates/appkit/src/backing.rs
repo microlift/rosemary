@@ -2323,7 +2323,14 @@ fn place_tree(window: Id, sdl: sdl3::Window) -> Vec<Placed> {
         host_pixels: (pixel_width, pixel_height),
     };
     place_view(content, base, false, logical_clip, geometry, 0, &mut out);
-    out
+    // What a view blending behind the window shows is behind all of the
+    // window's drawing, wherever the view is among its siblings.
+    let (behind, mut rest): (Vec<Placed>, Vec<Placed>) = out
+        .into_iter()
+        .partition(|p| p.view != content && crate::visual_effect::blends_behind_window(p.view));
+    let after_content = rest.len().min(1);
+    rest.splice(after_content..after_content, behind);
+    rest
 }
 
 /// Window pixels per point where `view` would draw.

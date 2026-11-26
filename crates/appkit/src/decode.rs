@@ -147,6 +147,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSSwitch" => switch(builder, uid),
         "NSSplitView" => split_view(builder, uid),
         "NSStackView" => stack_view(builder, uid),
+        "NSVisualEffectView" => visual_effect_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         "NSLayoutConstraint" => constraint(builder, uid),
         "NSNib" => builder
@@ -251,6 +252,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSSwitch",
     "NSSplitView",
     "NSStackView",
+    "NSVisualEffectView",
     "NSLayoutConstraint",
     "NSNib",
 ];
@@ -642,6 +644,22 @@ fn stack_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
                     f(view, objc::sel::get("addView:inGravity:"), arranged, gravity);
                 }
             }
+        }
+    }
+    Some(view)
+}
+
+/// `NSVisualEffectView`: a view, its material, and how it blends.
+fn visual_effect_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let view = view(builder, uid, "NSVisualEffectView")?;
+    for (key, selector) in [
+        ("NSVisualEffectViewMaterial", "setMaterial:"),
+        ("NSVisualEffectViewBlendingMode", "setBlendingMode:"),
+        ("NSVisualEffectViewState", "setState:"),
+    ] {
+        if let Some(value) = integer(builder, uid, key) {
+            // SAFETY: each setter takes one `NSInteger`.
+            unsafe { send_integer(view, selector, value as usize) };
         }
     }
     Some(view)

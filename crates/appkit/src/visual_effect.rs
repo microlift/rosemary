@@ -41,6 +41,20 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, dirty: NSRect) {
     crate::color::NSRectFill(dirty);
 }
 
+/// `NSVisualEffectBlendingModeBehindWindow`, which is also the default.
+const BEHIND_WINDOW: usize = 0;
+
+/// Whether `view` shows what is behind its window rather than what is behind
+/// it in the window.
+pub(crate) fn blends_behind_window(view: Id) -> bool {
+    let Some(class) = objc::class::lookup(c"NSVisualEffectView") else {
+        return false;
+    };
+    // SAFETY: a live view.
+    let is_effect_view = unsafe { corefoundation::base::is_kind_of(view.cast(), class) };
+    is_effect_view && props::integer(view, "blendingMode") == BEHIND_WINDOW
+}
+
 /// `-interiorBackgroundStyle`: light for every material drawn here.
 unsafe extern "C" fn interior_background_style(_receiver: Id, _sel: Sel) -> usize {
     0
