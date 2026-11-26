@@ -109,6 +109,7 @@ pub(crate) fn forget(object: Id) {
     crate::segmented::forget(object);
     crate::table::forget(object);
     crate::table::forget_header(object);
+    crate::collection::forget(object);
     let mut table = stacks().lock().unwrap_or_else(|e| e.into_inner());
     table.remove(&(object as usize));
     for stack in table.values_mut() {

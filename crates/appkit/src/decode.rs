@@ -142,6 +142,8 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSTabViewItem" => tab_view_item(builder, uid),
         "NSTableHeaderView" => view(builder, uid, "NSTableHeaderView"),
         "NSTreeController" => tree_controller(builder, uid),
+        "NSCollectionView" => collection_view(builder, uid),
+        "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         _ => None,
     }
 }
@@ -174,6 +176,8 @@ pub(crate) const DECODED: &[&str] = &[
     "NSTabViewItem",
     "NSTableHeaderView",
     "NSTreeController",
+    "NSCollectionView",
+    "NSCollectionViewGridLayout",
 ];
 
 /// A boolean field, which an archive writes as a boolean or as an integer.
@@ -383,8 +387,10 @@ fn custom_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         .to_string();
     let view = view(builder, uid, &wanted)?;
     // A swapper keeps the archived class's own keys; a table's are its rows.
-    if text(builder, uid, "NSOriginalClassName") == Some("NSTableView") {
-        table_details(builder, uid, view);
+    match text(builder, uid, "NSOriginalClassName") {
+        Some("NSTableView") => table_details(builder, uid, view),
+        Some("NSCollectionView") => collection_details(builder, uid, view),
+        _ => {}
     }
     Some(view)
 }
@@ -462,6 +468,81 @@ fn table_column(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         objc::arc::release(title);
     }
     Some(column)
+}
+
+/// `NSCollectionView`: a view, its selection settings, background colours
+/// and the layout its core archives.
+fn collection_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let view = view(builder, uid, "NSCollectionView")?;
+    collection_details(builder, uid, view);
+    Some(view)
+}
+
+fn collection_details(builder: &mut dyn Builder, uid: Uid, view: Id) {
+    for (key, selector) in [
+        ("NSSelectable", "setSelectable:"),
+        ("NSAllowsMultipleSelection", "setAllowsMultipleSelection:"),
+        ("NSAllowsEmptySelection", "setAllowsEmptySelection:"),
+    ] {
+        if let Some(value) = flag(builder, uid, key) {
+            // SAFETY: each setter takes one `BOOL`.
+            unsafe { send_flag(view, selector, value) };
+        }
+    }
+    if let Some(colors) = builder.archive().field_object(uid, "NSBackgroundColors")
+        && let Some(colors) = builder.object_at(colors)
+    {
+        // SAFETY: `-setBackgroundColors:` takes one array.
+        unsafe { send_object(view, "setBackgroundColors:", colors) };
+    }
+    if let Some(layout) = builder
+        .archive()
+        .field_object(uid, "NSCollectionViewCore")
+        .and_then(|core| builder.archive().field_object(core, "UICollectionLayout"))
+    {
+        match builder.object_at(layout) {
+            // SAFETY: `-setCollectionViewLayout:` takes one layout.
+            Some(layout) => unsafe { send_object(view, "setCollectionViewLayout:", layout) },
+            None => {
+                let name = builder
+                    .archive()
+                    .class_name(layout)
+                    .unwrap_or("?")
+                    .to_string();
+                builder.note_missing(&name);
+            }
+        }
+    }
+}
+
+/// `NSCollectionViewGridLayout`: its item sizes and background colours.
+fn grid_layout(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let layout = allocate("NSCollectionViewGridLayout")?;
+    // SAFETY: `-init` is `id (id, SEL)`.
+    let layout = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(layout, objc::sel::get("init"))
+    };
+    for (key, selector) in [
+        ("NSMinimumItemSize", "setMinimumItemSize:"),
+        ("NSMaximumItemSize", "setMaximumItemSize:"),
+    ] {
+        if let Some(value) = text(builder, uid, key).and_then(size) {
+            // SAFETY: each setter takes one `NSSize`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, NSSize) =
+                    std::mem::transmute(objc::msg::entry());
+                f(layout, objc::sel::get(selector), value);
+            }
+        }
+    }
+    if let Some(colors) = builder.archive().field_object(uid, "NSBackgroundColors")
+        && let Some(colors) = builder.object_at(colors)
+    {
+        // SAFETY: `-setBackgroundColors:` takes one array.
+        unsafe { send_object(layout, "setBackgroundColors:", colors) };
+    }
+    Some(layout)
 }
 
 /// `NSTreeController`: `-init`, then what Interface Builder set. A flag the

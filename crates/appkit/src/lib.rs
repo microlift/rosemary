@@ -30,6 +30,7 @@ pub mod cgfont;
 pub mod cgpaint;
 pub mod cgpath;
 pub mod classes;
+mod collection;
 pub mod color;
 mod controls;
 mod coreanimation;
@@ -114,6 +115,7 @@ pub fn bootstrap() {
         bindings::install();
         table_views::install();
         tree_controller::install();
+        collection::install();
         visual_effect::install();
         alert::install();
         panel::install();
