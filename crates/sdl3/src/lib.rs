@@ -368,6 +368,7 @@ struct Api {
     SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
     SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
     SDL_GetWindowProperties: Option<unsafe extern "C" fn(Window) -> PropertiesId>,
+    SDL_GetGlobalProperties: Option<unsafe extern "C" fn() -> PropertiesId>,
     SDL_GetNumberProperty: Option<unsafe extern "C" fn(PropertiesId, *const c_char, i64) -> i64>,
     SDL_GetPointerProperty:
         Option<unsafe extern "C" fn(PropertiesId, *const c_char, *mut c_void) -> *mut c_void>,
@@ -610,6 +611,7 @@ fn api() -> Option<&'static Api> {
             SDL_GetSystemTheme,
             SDL_GetCurrentVideoDriver,
             SDL_GetWindowProperties,
+            SDL_GetGlobalProperties,
             SDL_GetNumberProperty,
             SDL_GetPointerProperty,
             SDL_OpenAudioDeviceStream,
@@ -5511,6 +5513,29 @@ pub mod video {
         };
         let handle = unsafe { number(properties, c"SDL.window.x11.window".as_ptr(), 0) };
         (!display.is_null() && handle != 0).then_some((display, handle as u64))
+    }
+
+    /// The X11 window behind an SDL window, as the window manager names it.
+    pub fn x11_window_id(window: Window) -> Option<u64> {
+        x11_native_window(window).map(|(_, handle)| handle)
+    }
+
+    /// SDL's `wl_display`, once video is up on Wayland.
+    pub fn wayland_display() -> Option<*mut c_void> {
+        if !is_wayland() {
+            return None;
+        }
+        let api = api()?;
+        let (globals, get) = (api.SDL_GetGlobalProperties?, api.SDL_GetPointerProperty?);
+        // SAFETY: takes nothing, and a property name SDL documents.
+        let display = unsafe {
+            get(
+                globals(),
+                c"SDL.video.wayland.wl_display".as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        (!display.is_null()).then_some(display)
     }
 
     /// A window's `wl_display` and `wl_surface`, on Wayland.

@@ -41,6 +41,12 @@ struct Client {
         unsafe extern "C" fn(*mut c_void, u32, *const c_void, u32, u32, ...) -> *mut c_void,
     wl_proxy_add_listener: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int,
     wl_proxy_get_version: unsafe extern "C" fn(*mut c_void) -> u32,
+    wl_proxy_create_wrapper: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    wl_proxy_wrapper_destroy: unsafe extern "C" fn(*mut c_void),
+    wl_proxy_set_queue: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    wl_proxy_destroy: unsafe extern "C" fn(*mut c_void),
+    wl_display_create_queue: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    wl_display_roundtrip_queue: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
     wl_registry_interface: *const c_void,
     wl_seat_interface: *const c_void,
     wl_pointer_interface: *const c_void,
@@ -156,6 +162,52 @@ static LOCKED_POINTER_EVENTS: [Message; 2] = [
 ];
 static UNTYPED_PAIR: Types<2> = Types([std::ptr::null(); 2]);
 
+/// `org_kde_kwin_appmenu_manager`, KWin's way for a surface to name the
+/// dbusmenu object that holds its window's menus.
+static APPMENU_MANAGER_INTERFACE: Interface = Interface {
+    name: c"org_kde_kwin_appmenu_manager".as_ptr(),
+    version: 2,
+    method_count: 2,
+    methods: (&raw const APPMENU_MANAGER_REQUESTS).cast(),
+    event_count: 0,
+    events: std::ptr::null(),
+};
+static APPMENU_MANAGER_REQUESTS: [Message; 2] = [
+    Message {
+        name: c"create".as_ptr(),
+        signature: c"no".as_ptr(),
+        types: (&raw const APPMENU_CREATE_TYPES).cast(),
+    },
+    Message {
+        name: c"release".as_ptr(),
+        signature: c"2".as_ptr(),
+        types: NO_TYPES,
+    },
+];
+static APPMENU_CREATE_TYPES: Types<2> = Types([&raw const APPMENU_INTERFACE, std::ptr::null()]);
+
+/// `org_kde_kwin_appmenu`.
+static APPMENU_INTERFACE: Interface = Interface {
+    name: c"org_kde_kwin_appmenu".as_ptr(),
+    version: 2,
+    method_count: 2,
+    methods: (&raw const APPMENU_REQUESTS).cast(),
+    event_count: 0,
+    events: std::ptr::null(),
+};
+static APPMENU_REQUESTS: [Message; 2] = [
+    Message {
+        name: c"set_address".as_ptr(),
+        signature: c"ss".as_ptr(),
+        types: (&raw const UNTYPED_PAIR).cast(),
+    },
+    Message {
+        name: c"release".as_ptr(),
+        signature: c"".as_ptr(),
+        types: NO_TYPES,
+    },
+];
+
 // SAFETY: function pointers and pointers to libwayland's static interface
 // descriptions.
 unsafe impl Send for Client {}
@@ -206,6 +258,38 @@ fn client() -> Option<&'static Client> {
                         *mut c_void,
                         unsafe extern "C" fn(*mut c_void) -> u32,
                     >(symbol(c"wl_proxy_get_version")?),
+                    wl_proxy_create_wrapper: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+                    >(symbol(
+                        c"wl_proxy_create_wrapper",
+                    )?),
+                    wl_proxy_wrapper_destroy: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void),
+                    >(symbol(
+                        c"wl_proxy_wrapper_destroy",
+                    )?),
+                    wl_proxy_set_queue: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void, *mut c_void),
+                    >(symbol(c"wl_proxy_set_queue")?),
+                    wl_proxy_destroy: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void),
+                    >(symbol(c"wl_proxy_destroy")?),
+                    wl_display_create_queue: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+                    >(symbol(
+                        c"wl_display_create_queue",
+                    )?),
+                    wl_display_roundtrip_queue: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+                    >(symbol(
+                        c"wl_display_roundtrip_queue",
+                    )?),
                     wl_registry_interface: symbol(c"wl_registry_interface")?,
                     wl_seat_interface: symbol(c"wl_seat_interface")?,
                     wl_pointer_interface: symbol(c"wl_pointer_interface")?,
@@ -226,6 +310,9 @@ const WL_REGION_ADD: u32 = 1;
 const WL_SURFACE_SET_INPUT_REGION: u32 = 5;
 const WL_SURFACE_COMMIT: u32 = 6;
 const WL_MARSHAL_FLAG_DESTROY: u32 = 1;
+const ORG_KDE_KWIN_APPMENU_MANAGER_CREATE: u32 = 0;
+const ORG_KDE_KWIN_APPMENU_SET_ADDRESS: u32 = 0;
+const ORG_KDE_KWIN_APPMENU_RELEASE: u32 = 1;
 const ZWP_POINTER_CONSTRAINTS_V1_LOCK_POINTER: u32 = 1;
 const ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT: u32 = 1;
 const ZWP_LOCKED_POINTER_V1_DESTROY: u32 = 0;
@@ -757,6 +844,158 @@ unsafe extern "C" fn axis(
     _axis: u32,
     _value: i32,
 ) {
+}
+
+/// The display's `org_kde_kwin_appmenu_manager`, bound on first use; `None`
+/// when the compositor has none.
+///
+/// Bound through a queue of its own and a roundtrip on it, so the answer is
+/// known at once and SDL's queue is left alone. Neither the manager nor the
+/// objects it makes have events, so that queue is never dispatched again.
+pub fn appmenu_manager(display: *mut c_void) -> Option<usize> {
+    static MANAGER: OnceLock<usize> = OnceLock::new();
+    let manager = *MANAGER.get_or_init(|| {
+        let Some(client) = client() else {
+            return 0;
+        };
+        if display.is_null() {
+            return 0;
+        }
+        let mut found: usize = 0;
+        // SAFETY: SDL's live display. Each request is spelled as the
+        // header's inline wrapper spells it, and the registry's listener
+        // only runs inside the roundtrip, while `found` is alive.
+        unsafe {
+            let queue = (client.wl_display_create_queue)(display);
+            if queue.is_null() {
+                return 0;
+            }
+            let wrapper = (client.wl_proxy_create_wrapper)(display);
+            if wrapper.is_null() {
+                return 0;
+            }
+            (client.wl_proxy_set_queue)(wrapper, queue);
+            let registry = (client.wl_proxy_marshal_flags)(
+                wrapper,
+                WL_DISPLAY_GET_REGISTRY,
+                client.wl_registry_interface,
+                (client.wl_proxy_get_version)(wrapper),
+                0,
+                std::ptr::null_mut::<c_void>(),
+            );
+            (client.wl_proxy_wrapper_destroy)(wrapper);
+            if registry.is_null() {
+                return 0;
+            }
+            (client.wl_proxy_add_listener)(
+                registry,
+                (&raw const APPMENU_REGISTRY_LISTENER).cast(),
+                (&raw mut found).cast(),
+            );
+            (client.wl_display_roundtrip_queue)(display, queue);
+            // wl_registry has no destructor request; this forgets it here.
+            (client.wl_proxy_destroy)(registry);
+        }
+        found
+    });
+    (manager != 0).then_some(manager)
+}
+
+static APPMENU_REGISTRY_LISTENER: RegistryListener = RegistryListener {
+    global: appmenu_global,
+    global_remove,
+};
+
+unsafe extern "C" fn appmenu_global(
+    data: *mut c_void,
+    registry: *mut c_void,
+    name: u32,
+    interface: *const c_char,
+    version: u32,
+) {
+    let Some(client) = client() else {
+        return;
+    };
+    // SAFETY: libwayland passes the interface's NUL-terminated name.
+    if interface.is_null()
+        || unsafe { CStr::from_ptr(interface) } != c"org_kde_kwin_appmenu_manager"
+    {
+        return;
+    }
+    let version = version.min(APPMENU_MANAGER_INTERFACE.version as u32);
+    // SAFETY: `wl_registry_bind` as the header's inline wrapper spells it;
+    // `data` is the `usize` `appmenu_manager` waits on.
+    unsafe {
+        let manager = (client.wl_proxy_marshal_flags)(
+            registry,
+            WL_REGISTRY_BIND,
+            (&raw const APPMENU_MANAGER_INTERFACE).cast(),
+            version,
+            0,
+            name,
+            APPMENU_MANAGER_INTERFACE.name,
+            version,
+            std::ptr::null_mut::<c_void>(),
+        );
+        *data.cast::<usize>() = manager as usize;
+    }
+}
+
+/// Tell the compositor that `surface`'s menus are the dbusmenu object at
+/// `path` of the bus connection `service`. The answer is the object to
+/// [`release_appmenu`] before the surface goes.
+pub fn set_appmenu(manager: usize, surface: *mut c_void, service: &CStr, path: &CStr) -> usize {
+    let Some(client) = client() else {
+        return 0;
+    };
+    let manager = manager as Proxy;
+    // SAFETY: the bound manager and the caller's live surface, with each
+    // request spelled as the protocol's generated inline wrapper spells it.
+    unsafe {
+        let appmenu = (client.wl_proxy_marshal_flags)(
+            manager,
+            ORG_KDE_KWIN_APPMENU_MANAGER_CREATE,
+            (&raw const APPMENU_INTERFACE).cast(),
+            (client.wl_proxy_get_version)(manager),
+            0,
+            std::ptr::null_mut::<c_void>(),
+            surface,
+        );
+        if appmenu.is_null() {
+            return 0;
+        }
+        (client.wl_proxy_marshal_flags)(
+            appmenu,
+            ORG_KDE_KWIN_APPMENU_SET_ADDRESS,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(appmenu),
+            0,
+            service.as_ptr(),
+            path.as_ptr(),
+        );
+        appmenu as usize
+    }
+}
+
+/// Destroy an object [`set_appmenu`] made.
+pub fn release_appmenu(appmenu: usize) {
+    let Some(client) = client() else {
+        return;
+    };
+    if appmenu == 0 {
+        return;
+    }
+    let appmenu = appmenu as Proxy;
+    // SAFETY: a live appmenu object of this module's.
+    unsafe {
+        (client.wl_proxy_marshal_flags)(
+            appmenu,
+            ORG_KDE_KWIN_APPMENU_RELEASE,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(appmenu),
+            WL_MARSHAL_FLAG_DESTROY,
+        );
+    }
 }
 
 #[cfg(test)]
