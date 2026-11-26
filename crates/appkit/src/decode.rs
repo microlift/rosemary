@@ -835,6 +835,8 @@ fn controller(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<I
             objc::arc::release(path);
         }
     }
+    // Interface Builder archives each of these only when it is set, and the
+    // decoder reads an absent one as NO, whatever `-init` defaults it to.
     for (key, selector) in [
         ("NSEditable", "setEditable:"),
         ("NSAvoidsEmptySelection", "setAvoidsEmptySelection:"),
@@ -858,7 +860,9 @@ fn controller(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<I
             "setAlwaysUsesMultipleValuesMarker:",
         ),
     ] {
-        if let Some(value) = flag(builder, uid, key) {
+        // Some are only an array controller's.
+        if responds(controller, selector) {
+            let value = flag(builder, uid, key).unwrap_or(false);
             // SAFETY: each setter takes one `BOOL`.
             unsafe { send_flag(controller, selector, value) };
         }
@@ -1897,6 +1901,23 @@ mod tests {
         let arranged: Id = send(stack, "arrangedSubviews");
         assert_eq!(send::<usize>(arranged, "count"), 2);
         assert!(crate::controls::has_stacks());
+    }
+
+    /// A controller flag the nib leaves out is off, though `-init` would
+    /// have turned it on: an archive holds only the flags that are set.
+    #[test]
+    fn a_controller_flag_the_nib_leaves_out_is_off() {
+        use crate::fixture::{Field, archive};
+        let controller = decode(&archive(
+            "root",
+            &[(
+                "NSTreeController",
+                vec![("NSPreservesSelection", Field::Bool(true))],
+            )],
+        ));
+        assert_eq!(send::<u8>(controller, "preservesSelection"), 1);
+        assert_eq!(send::<u8>(controller, "avoidsEmptySelection"), 0);
+        assert_eq!(send::<u8>(controller, "selectsInsertedObjects"), 0);
     }
 
     /// A view resizes with its superview because the *nib* said so. Nothing
