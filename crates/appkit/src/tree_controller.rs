@@ -19,10 +19,10 @@ pub(crate) const TREE_CONTROLLER_INSTANCE_SIZE: usize = size_of::<TreeController
 pub(crate) const TREE_NODE_INSTANCE_SIZE: usize = size_of::<TreeNode>();
 
 #[repr(C)]
-struct ObjectController {
+pub(crate) struct ObjectController {
     isa: *const c_void,
     /// Retained.
-    content: Id,
+    pub(crate) content: Id,
     /// A class, which needs no reference.
     object_class: Id,
     editable: u8,
@@ -70,7 +70,7 @@ fn children_changed_context() -> usize {
     &CHILDREN_CHANGED as *const u8 as usize
 }
 
-fn object(receiver: Id) -> &'static mut ObjectController {
+pub(crate) fn object(receiver: Id) -> &'static mut ObjectController {
     // SAFETY: an `NSObjectController`, laid out as this module allocates it.
     unsafe { &mut *(receiver as *mut ObjectController) }
 }
@@ -85,7 +85,7 @@ fn node(receiver: Id) -> &'static mut TreeNode {
     unsafe { &mut *(receiver as *mut TreeNode) }
 }
 
-fn send_id(receiver: Id, sel: &str) -> Id {
+pub(crate) fn send_id(receiver: Id, sel: &str) -> Id {
     // SAFETY: `id (id, SEL)`, as each selector this is used with is.
     unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
@@ -93,7 +93,7 @@ fn send_id(receiver: Id, sel: &str) -> Id {
     }
 }
 
-fn send_id_id(receiver: Id, sel: &str, argument: Id) -> Id {
+pub(crate) fn send_id_id(receiver: Id, sel: &str, argument: Id) -> Id {
     // SAFETY: `id (id, SEL, id)`, as each selector this is used with is.
     unsafe {
         let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
@@ -101,7 +101,7 @@ fn send_id_id(receiver: Id, sel: &str, argument: Id) -> Id {
     }
 }
 
-fn send_word(receiver: Id, sel: &str) -> usize {
+pub(crate) fn send_word(receiver: Id, sel: &str) -> usize {
     // SAFETY: `NSInteger`, `NSUInteger` or `BOOL (id, SEL)`, as each selector
     // this is used with is; a `BOOL` is read from its low byte.
     unsafe {
@@ -111,7 +111,7 @@ fn send_word(receiver: Id, sel: &str) -> usize {
 }
 
 /// `-willChangeValueForKey:` or `-didChangeValueForKey:`.
-fn announce(receiver: Id, sel: &str, key: &str) {
+pub(crate) fn announce(receiver: Id, sel: &str, key: &str) {
     let key = foundation::string::from_str(key);
     // SAFETY: `void (id, SEL, NSString *)`.
     unsafe {
@@ -122,13 +122,13 @@ fn announce(receiver: Id, sel: &str, key: &str) {
 }
 
 /// Replace a retained slot's object with `value`, retained.
-fn replace(slot: &mut Id, value: Id) {
+pub(crate) fn replace(slot: &mut Id, value: Id) {
     let old = std::mem::replace(slot, objc::arc::retain(value));
     objc::arc::release(old);
 }
 
 /// Replace a retained slot's object with a copy of `value`.
-fn replace_with_copy(slot: &mut Id, value: Id) {
+pub(crate) fn replace_with_copy(slot: &mut Id, value: Id) {
     let copy = match value.is_null() {
         true => value,
         false => send_id(value, "copy"),
@@ -137,7 +137,7 @@ fn replace_with_copy(slot: &mut Id, value: Id) {
 }
 
 /// A new, autoreleased `NSArray` of `objects`.
-fn array(objects: &[Id]) -> Id {
+pub(crate) fn array(objects: &[Id]) -> Id {
     let values: Vec<_> = objects
         .iter()
         .map(|o| *o as corefoundation::base::CFTypeRef)
@@ -152,7 +152,7 @@ fn array(objects: &[Id]) -> Id {
 
 /// The elements of an array, none for nil, or a failure naming `what` for
 /// anything else.
-fn elements(value: Id, what: &dyn Fn() -> String) -> Vec<Id> {
+pub(crate) fn elements(value: Id, what: &dyn Fn() -> String) -> Vec<Id> {
     if value.is_null() {
         return Vec::new();
     }
@@ -167,13 +167,13 @@ fn elements(value: Id, what: &dyn Fn() -> String) -> Vec<Id> {
     }
 }
 
-fn class_named(name: &std::ffi::CStr) -> Id {
+pub(crate) fn class_named(name: &std::ffi::CStr) -> Id {
     objc::class::ptr(objc::class::lookup(name).expect("registered before AppKit")) as Id
 }
 
 // NSObjectController.
 
-unsafe extern "C" fn object_init(receiver: Id, _sel: Sel) -> Id {
+pub(crate) unsafe extern "C" fn object_init(receiver: Id, _sel: Sel) -> Id {
     if receiver.is_null() {
         return receiver;
     }
@@ -191,7 +191,7 @@ unsafe extern "C" fn init_with_content(receiver: Id, _sel: Sel, content: Id) -> 
     receiver
 }
 
-unsafe extern "C" fn object_dealloc(receiver: Id, _sel: Sel) {
+pub(crate) unsafe extern "C" fn object_dealloc(receiver: Id, _sel: Sel) {
     objc::arc::release(object(receiver).content);
     objc::arc::finalize(receiver);
 }

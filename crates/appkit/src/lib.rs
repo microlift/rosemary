@@ -17,6 +17,7 @@ mod animation;
 pub mod appearance;
 pub mod application;
 mod aqua;
+mod array_controller;
 pub mod backing;
 mod bezier;
 mod bindings;
@@ -115,6 +116,7 @@ pub fn bootstrap() {
         bindings::install();
         table_views::install();
         tree_controller::install();
+        array_controller::install();
         collection::install();
         visual_effect::install();
         alert::install();

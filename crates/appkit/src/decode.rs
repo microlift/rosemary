@@ -141,7 +141,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSTabView" => tab_view(builder, uid),
         "NSTabViewItem" => tab_view_item(builder, uid),
         "NSTableHeaderView" => view(builder, uid, "NSTableHeaderView"),
-        "NSTreeController" => tree_controller(builder, uid),
+        "NSTreeController" | "NSArrayController" => controller(builder, uid, class_name),
         "NSCollectionView" => collection_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         _ => None,
@@ -176,6 +176,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSTabViewItem",
     "NSTableHeaderView",
     "NSTreeController",
+    "NSArrayController",
     "NSCollectionView",
     "NSCollectionViewGridLayout",
 ];
@@ -545,10 +546,11 @@ fn grid_layout(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
     Some(layout)
 }
 
-/// `NSTreeController`: `-init`, then what Interface Builder set. A flag the
-/// archive leaves out is the controller's default.
-fn tree_controller(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
-    let controller = allocate("NSTreeController")?;
+/// `NSTreeController` and `NSArrayController`: `-init`, then what
+/// Interface Builder set. A flag the archive leaves out is the controller's
+/// default.
+fn controller(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
+    let controller = allocate(class_name)?;
     // SAFETY: `-init` is `id (id, SEL)`.
     let controller = unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
@@ -586,6 +588,19 @@ fn tree_controller(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         (
             "NSAutomaticallyPreparesContent",
             "setAutomaticallyPreparesContent:",
+        ),
+        (
+            "NSAutomaticallyRearrangesObjects",
+            "setAutomaticallyRearrangesObjects:",
+        ),
+        (
+            "NSClearsFilterPredicateOnInsertion",
+            "setClearsFilterPredicateOnInsertion:",
+        ),
+        ("NSFilterRestrictsInsertion", "setFilterRestrictsInsertion:"),
+        (
+            "NSAlwaysUsesMultipleValuesMarker",
+            "setAlwaysUsesMultipleValuesMarker:",
         ),
     ] {
         if let Some(value) = flag(builder, uid, key) {
