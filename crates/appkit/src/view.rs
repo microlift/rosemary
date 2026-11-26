@@ -2862,6 +2862,15 @@ unsafe extern "C" fn mouse_in_rect(receiver: Id, _sel: Sel, point: NSPoint, rect
     crate::geometry::mouse_in_rect(point, rect, is_flipped(receiver)) as u8
 }
 
+/// `-needsToDrawRect:`.
+///
+/// FIXME (ACCURACY): the rects being drawn are not tracked per view, so any
+/// rect that meets the view's bounds is said to need drawing.
+unsafe extern "C" fn needs_to_draw_rect(receiver: Id, _sel: Sel, rect: NSRect) -> u8 {
+    // SAFETY: plain geometry.
+    unsafe { crate::geometry::NSIntersectsRect(rect, bounds_of(receiver)) }
+}
+
 /// A point from `from`'s coordinates to `to`'s, through their window; `nil`
 /// on either side is the window itself.
 fn convert_point(point: NSPoint, from: Id, to: Id) -> NSPoint {
@@ -3699,6 +3708,7 @@ pub(crate) fn install() {
         "convertPoint:toView:" => convert_point_to_view, c"{CGPoint=dd}40@0:8{CGPoint=dd}16@32";
         "mouse:inRect:" => mouse_in_rect,
             c"c56@0:8{CGPoint=dd}16{CGRect={CGPoint=dd}{CGSize=dd}}32";
+        "needsToDrawRect:" => needs_to_draw_rect, c"c48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertRect:fromView:" => convert_rect_from_view,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
         "convertRect:toView:" => convert_rect_to_view,

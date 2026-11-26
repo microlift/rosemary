@@ -587,8 +587,12 @@ mod slot {
     pub const BUTTON_IMAGE_SCALING: usize = 25;
     /// `-hasDestructiveAction`, only read back: nothing here draws it red.
     pub const DESTRUCTIVE: usize = 26;
-    pub const BUTTON_OBJECTS: [usize; 8] = [
+    /// `-bezelColor`, retained.
+    pub const BEZEL_COLOR: usize = 27;
+    pub const BORDER_ONLY_WHILE_MOUSE_INSIDE: usize = 28;
+    pub const BUTTON_OBJECTS: [usize; 9] = [
         TINT_COLOR,
+        BEZEL_COLOR,
         IMAGE,
         TITLE,
         ALTERNATE_IMAGE,
@@ -611,7 +615,7 @@ mod slot {
     pub const SCROLLER_STYLE: usize = 3;
 }
 
-const ROW: usize = 27;
+const ROW: usize = slot::BORDER_ONLY_WHILE_MOUSE_INSIDE + 1;
 
 fn read(table: &Mutex<HashMap<usize, Vec<usize>>>, receiver: Id, at: usize) -> usize {
     table
@@ -1182,6 +1186,33 @@ unsafe extern "C" fn button_content_tint_color(receiver: Id, _sel: Sel) -> Id {
     read(buttons(), receiver, slot::TINT_COLOR) as Id
 }
 
+unsafe extern "C" fn button_set_bezel_color(receiver: Id, _sel: Sel, value: Id) {
+    write_object(buttons(), receiver, slot::BEZEL_COLOR, value);
+    crate::backing::needs_display(receiver);
+}
+
+unsafe extern "C" fn button_bezel_color(receiver: Id, _sel: Sel) -> Id {
+    read(buttons(), receiver, slot::BEZEL_COLOR) as Id
+}
+
+unsafe extern "C" fn button_set_shows_border_only_while_mouse_inside(
+    receiver: Id,
+    _sel: Sel,
+    value: u8,
+) {
+    write(
+        buttons(),
+        receiver,
+        slot::BORDER_ONLY_WHILE_MOUSE_INSIDE,
+        usize::from(value != 0),
+    );
+    crate::backing::needs_display(receiver);
+}
+
+unsafe extern "C" fn button_shows_border_only_while_mouse_inside(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(read(buttons(), receiver, slot::BORDER_ONLY_WHILE_MOUSE_INSIDE) != 0)
+}
+
 unsafe extern "C" fn button_alternate_image(receiver: Id, _sel: Sel) -> Id {
     read(buttons(), receiver, slot::ALTERNATE_IMAGE) as Id
 }
@@ -1295,6 +1326,24 @@ unsafe extern "C" fn button_draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
     }
 }
 
+/// `NSWritingDirectionNatural`, a fresh control's.
+const WRITING_DIRECTION_NATURAL: isize = -1;
+
+/// Kept relative to natural, so a control never given one answers natural.
+/// FIXME (ACCURACY): kept, not applied: text here is laid out left to right.
+unsafe extern "C" fn control_set_base_writing_direction(receiver: Id, _sel: Sel, direction: isize) {
+    crate::props::set_integer_of(
+        receiver,
+        "baseWritingDirection",
+        direction.wrapping_sub(WRITING_DIRECTION_NATURAL) as usize,
+    );
+}
+
+unsafe extern "C" fn control_base_writing_direction(receiver: Id, _sel: Sel) -> isize {
+    (crate::props::integer(receiver, "baseWritingDirection") as isize)
+        .wrapping_add(WRITING_DIRECTION_NATURAL)
+}
+
 unsafe extern "C" fn control_set_tag(receiver: Id, _sel: Sel, tag: isize) {
     write(buttons(), receiver, slot::TAG, tag as usize);
 }
@@ -1357,7 +1406,10 @@ fn button_surface(
     frame: NSRect,
     draw_title: bool,
 ) -> Option<(Vec<u8>, usize, usize)> {
-    let bordered = read(buttons(), receiver, slot::NOT_BORDERED) == 0;
+    // FIXME (ACCURACY): the pointer is not tracked for this, so a button that
+    // shows its border only while the pointer is inside never shows it.
+    let bordered = read(buttons(), receiver, slot::NOT_BORDERED) == 0
+        && read(buttons(), receiver, slot::BORDER_ONLY_WHILE_MOUSE_INSIDE) == 0;
     let title = if draw_title {
         button_text(receiver)
     } else {
@@ -1379,7 +1431,17 @@ fn button_surface(
     let enabled = read(buttons(), receiver, slot::DISABLED) == 0;
     let dark = crate::appearance::is_dark();
     if bordered {
+        let bezel_color = read(buttons(), receiver, slot::BEZEL_COLOR) as Id;
         let face = match (dark, pressed) {
+            _ if !bezel_color.is_null() => {
+                // SAFETY: an `NSColor` the button holds.
+                let (r, g, b, a) = unsafe { crate::color::components(bezel_color) };
+                // FIXME (ACCURACY): a pressed coloured bezel is darkened by a
+                // fixed amount rather than drawn with Apple's artwork.
+                let shade = if pressed { 0.8 } else { 1.0 };
+                let channel = |c: f64| (c * shade * 255.0).round().clamp(0.0, 255.0) as u8;
+                chrome::Color::rgba(channel(r), channel(g), channel(b), a as f32)
+            }
             (false, true) => chrome::Color::rgba(178, 178, 178, 1.0),
             (false, false) => chrome::Color::rgba(236, 236, 236, 1.0),
             (true, true) => chrome::Color::rgba(128, 128, 128, 1.0),
@@ -2699,6 +2761,18 @@ pub(crate) fn install() {
         // as set, unformatted.
         "formatter" => crate::props::get_object, c"@16@0:8";
         "setFormatter:" => crate::props::set_retained, c"v24@0:8@16";
+        // FIXME (ACCURACY): kept, not applied: a control here truncates its
+        // title at the end on one line, whatever these say. `NSTextField`
+        // has its own, which are.
+        "lineBreakMode" => crate::props::get_integer, c"Q16@0:8";
+        "setLineBreakMode:" => crate::props::set_integer, c"v24@0:8Q16";
+        "usesSingleLineMode" => crate::props::get_bool, c"c16@0:8";
+        "setUsesSingleLineMode:" => crate::props::set_bool, c"v20@0:8c16";
+        "baseWritingDirection" => control_base_writing_direction, c"q16@0:8";
+        "setBaseWritingDirection:" => control_set_base_writing_direction, c"v24@0:8q16";
+        // Kept only: no tool tip shows a truncated title.
+        "allowsExpansionToolTips" => crate::props::get_bool, c"c16@0:8";
+        "setAllowsExpansionToolTips:" => crate::props::set_bool, c"v20@0:8c16";
     });
 
     let class = objc::class::lookup(c"NSButton").expect("declared before its methods");
@@ -2734,6 +2808,12 @@ pub(crate) fn install() {
         "action" => button_action, c":16@0:8";
         "setContentTintColor:" => button_set_content_tint_color, c"v24@0:8@16";
         "contentTintColor" => button_content_tint_color, c"@16@0:8";
+        "bezelColor" => button_bezel_color, c"@16@0:8";
+        "showsBorderOnlyWhileMouseInside" => button_shows_border_only_while_mouse_inside,
+        c"c16@0:8";
+        "setShowsBorderOnlyWhileMouseInside:" => button_set_shows_border_only_while_mouse_inside,
+        c"v20@0:8c16";
+        "setBezelColor:" => button_set_bezel_color, c"v24@0:8@16";
         "setAlternateImage:" => button_set_alternate_image, c"v24@0:8@16";
         "alternateImage" => button_alternate_image, c"@16@0:8";
         "setBordered:" => button_set_bordered, c"v20@0:8c16";

@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::{cell::RefCell, ptr};
 
-use foundation::geometry::{NSRect, NSSize};
+use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
 use objc::sel::Sel;
 
@@ -28,6 +28,10 @@ pub struct Image {
     /// run once, when the image's pixels are first wanted.
     handler: Id,
     handler_flipped: usize,
+    /// `-setAlignmentRect:`, meaningful once `alignment_rect_set` is nonzero;
+    /// until then the alignment rect is the whole image.
+    alignment_rect: NSRect,
+    alignment_rect_set: usize,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Image>();
@@ -782,6 +786,8 @@ unsafe extern "C" fn copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut c_void)
     to.size = from.size;
     to.template = from.template;
     to.focus_drawn = from.focus_drawn;
+    to.alignment_rect = from.alignment_rect;
+    to.alignment_rect_set = from.alignment_rect_set;
     let description = crate::props::object(receiver, "accessibilityDescription");
     if !description.is_null() {
         let key = objc::sel::get("accessibilityDescription") as *const c_void;
@@ -804,6 +810,23 @@ unsafe extern "C" fn size(receiver: Id, _sel: Sel) -> NSSize {
 
 unsafe extern "C" fn set_size(receiver: Id, _sel: Sel, size: NSSize) {
     image_of(receiver).size = size;
+}
+
+unsafe extern "C" fn alignment_rect(receiver: Id, _sel: Sel) -> NSRect {
+    let image = image_of(receiver);
+    match image.alignment_rect_set != 0 {
+        true => image.alignment_rect,
+        false => NSRect {
+            origin: NSPoint::default(),
+            size: image.size,
+        },
+    }
+}
+
+unsafe extern "C" fn set_alignment_rect(receiver: Id, _sel: Sel, rect: NSRect) {
+    let image = image_of(receiver);
+    image.alignment_rect = rect;
+    image.alignment_rect_set = 1;
 }
 
 /// `-initWithCGImage:size:`, where a zero size means the image's pixel size.
@@ -1109,6 +1132,8 @@ pub(crate) fn install() {
         "initByReferencingURL:" => init_with_contents_of_url, c"@24@0:8@16";
         "size" => size, c"{CGSize=dd}16@0:8";
         "setSize:" => set_size, c"v32@0:8{CGSize=dd}16";
+        "alignmentRect" => alignment_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
+        "setAlignmentRect:" => set_alignment_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setTemplate:" => set_template, c"v20@0:8c16";
         "isTemplate" => is_template, c"c16@0:8";
         "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
