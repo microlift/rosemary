@@ -456,6 +456,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFURLGetTypeID", U64),
     sig!("DASessionCreate", P, P),
     sig!("DADiskCreateFromVolumePath", P, P, P, P),
+    sig!("DADiskCreateFromBSDName", P, P, P, P),
     sig!("DADiskCopyDescription", P, P),
     sig!("CFURLEnumeratorCreateForMountedVolumes", P, P, U64, P),
     sig!("CFURLEnumeratorGetNextURL", I64, P, P, P),
@@ -678,6 +679,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFStringFindWithOptions", BOOL, P, P, I64, I64, U64, P),
     sig!("CFStringConvertEncodingToIANACharSetName", P, U32),
     sig!("CFStringConvertEncodingToNSStringEncoding", U64, U32),
+    sig!("CFPropertyListCreateDeepCopy", P, P, P, U64),
+    sig!("CFBundleCopyInfoDictionaryInDirectory", P, P),
+    sig!("CFBundleIsArchitectureLoadable", U8, I32),
     sig!("CFStringConvertIANACharSetNameToEncoding", U32, P),
     sig!("CFStringConvertNSStringEncodingToEncoding", U32, U64),
     sig!("CFStringConvertWindowsCodepageToEncoding", U32, U32),
@@ -1568,6 +1572,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // argument, so the entry names five pointers before the tail.
     vsig!("NSRunAlertPanel", I64, P, P, P, P, P),
     sig!("NSHomeDirectory", P),
+    sig!("NSHomeDirectoryForUser", P, P),
     sig!("NSUserName", P),
     sig!("NSFullUserName", P),
     sig!("NSGetUncaughtExceptionHandler", P),
@@ -1866,6 +1871,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // The block is thunked by `crate::shims::block` before this is reached.
     sig!("dyld_get_image_versions", V, P, P),
     sig!("dyld_shared_cache_some_image_overridden", BOOL),
+    sig!("_dyld_shared_cache_contains_path", BOOL, P),
     sig!("_dyld_get_shared_cache_range", P, P),
     sig!("_dyld_is_preoptimized_objc_image_loaded", BOOL, U16),
     sig!("_dyld_get_swift_prespecialized_data", P),

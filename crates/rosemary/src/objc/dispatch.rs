@@ -140,6 +140,18 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // the way back: a property handle is opaque, and the guest only ever hands
     // it to `property_getName` and its neighbours.
     rtc!([0], "class_addProperty", U8, P, P, P, I32),
+    // The protocol half of building a class at run time, which PyObjC does for
+    // every Python subclass of an Objective-C class.
+    Runtime {
+        name: "class_addProtocol",
+        types: &[U8, P, P],
+        classes: &[0],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[1],
+        struct_return: None,
+    },
     // Spelled out rather than built by a macro, as every entry taking a
     // protocol is.
     Runtime {
@@ -153,7 +165,9 @@ pub(super) static RUNTIME: &[Runtime] = &[
         struct_return: None,
     },
     rtc!([0], "class_copyIvarList", P, P, P),
+    rtc!([0], "class_copyMethodList", P, P, P),
     rtc!([0], "class_copyPropertyList", P, P, P),
+    rtc!([0], "class_copyProtocolList", P, P, P),
     rtc!([0] -> true, "class_createInstance", P, P, U64),
     rtc!([0], "class_getClassMethod", P, P, P),
     // `const char *class_getImageName(Class)`: answered by the image-name hook
@@ -169,6 +183,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0], "class_getName", P, P),
     rtc!([0], "class_getProperty", P, P, P),
     rtc!([0] -> true, "class_getSuperclass", P, P),
+    rtc!([0], "class_getVersion", I32, P),
     rtc!([0], "class_isMetaClass", U8, P),
     // `class_addMethod` that also overwrites; the IMP leaves as a thunk the same
     // way. Unity swizzles NSApplication with it at start-up.
@@ -176,6 +191,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0], "class_replaceProperty", V, P, P, P, I32),
     rtc!([0], "class_respondsToSelector", U8, P, P),
     rtc!([0, 1] -> true, "class_setSuperclass", P, P, P),
+    rtc!([0], "class_setVersion", V, P, I32),
     //
     // A guest that reads an ivar through `object_getIvar` rather than through a
     // compiled displacement is asking the *host* runtime where the ivar is, and
@@ -195,6 +211,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0] -> true, "objc_allocWithZone", P, P),
     rtc!([0], "objc_alloc_init", P, P),
     rtc!([0] -> true, "objc_allocateClassPair", P, P, P, U64),
+    rt!("objc_allocateProtocol", P, P),
     rtc!([0], "objc_autorelease", P, P),
     rt!("objc_autoreleasePoolPop", V, P),
     rt!("objc_autoreleasePoolPush", P),
@@ -214,6 +231,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // a guest may legally weakly reference a class, and a class is the one
     // pointer that means something different on each side.
     rt!("objc_copyClassNamesForImage", P, P, P),
+    rt!("objc_copyProtocolList", P, P),
     // `void objc_copyStruct(void *dest, const void *src, ptrdiff_t size,
     // BOOL atomic, BOOL hasStrong)` - a synthesized accessor of a struct-typed
     // `atomic` property.
@@ -221,12 +239,17 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_copyWeak", V, P, P),
     rt!("objc_destroyWeak", V, P),
     rt!("objc_destructInstance", P, P),
+    rtc!([0], "objc_disposeClassPair", V, P),
     // The hook the compiler emits inside every `for (x in collection)` loop, to
     // be called when the collection changed underneath it.
     rt!("objc_enumerationMutation", V, P),
     // `object_getClass` of a class is its metaclass, so the argument is
     // translated as well as the result.
     rtc!([0] -> true, "objc_getClass", P, P),
+    // `int objc_getClassList(Class *buffer, int count)`.
+    // FIXME (ACCURACY): the classes written into the buffer cross untranslated,
+    // which is only right for classes the guest did not declare in its image.
+    rt!("objc_getClassList", I32, P, I32),
     rtc!([] -> true, "objc_getMetaClass", P, P),
     //
     // A `@synthesize`d property does not compile to a load and a store. For
@@ -271,6 +294,16 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // Swift hands over a generic class it has instantiated.
     rtc!([0] -> true, "objc_readClassPair", P, P, P),
     rtc!([0], "objc_registerClassPair", V, P),
+    Runtime {
+        name: "objc_registerProtocol",
+        types: &[V, P],
+        classes: &[],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[0],
+        struct_return: None,
+    },
     rtc!([0], "objc_release", V, P),
     rtc!([0], "objc_retain", P, P),
     rtc!([0], "objc_retainAutorelease", P, P),
@@ -323,6 +356,26 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("property_getAttributes", P, P),
     rt!("property_getName", P, P),
     Runtime {
+        name: "protocol_addMethodDescription",
+        types: &[V, P, P, P, U8, U8],
+        classes: &[],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[0],
+        struct_return: None,
+    },
+    Runtime {
+        name: "protocol_addProtocol",
+        types: &[V, P, P],
+        classes: &[],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[0, 1],
+        struct_return: None,
+    },
+    Runtime {
         name: "protocol_conformsToProtocol",
         types: &[U8, P, P],
         classes: &[],
@@ -330,6 +383,18 @@ pub(super) static RUNTIME: &[Runtime] = &[
         callbacks: &[],
         blocks: &[],
         protocols: &[0, 1],
+        struct_return: None,
+    },
+    // `struct objc_method_description *protocol_copyMethodDescriptionList(
+    // Protocol *, BOOL isRequiredMethod, BOOL isInstanceMethod, unsigned *)`
+    Runtime {
+        name: "protocol_copyMethodDescriptionList",
+        types: &[P, P, U8, U8, P],
+        classes: &[],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[0],
         struct_return: None,
     },
     //

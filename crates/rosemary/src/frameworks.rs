@@ -967,6 +967,7 @@ fn avfoundation_data() -> Vec<(String, u64)> {
 fn shimmed() -> Vec<(&'static str, *const ())> {
     vec![
         ("NSLog", crate::shims::nslog::native::nslog() as *const ()),
+        ("NSLogv", crate::shims::nslog::native::nslogv() as *const ()),
         (
             "NSRunAlertPanel",
             crate::shims::nslog::native::run_alert_panel() as *const (),
@@ -1017,6 +1018,22 @@ fn framework_symbol(row: usize, name: &str) -> Option<u64> {
 /// A variable the flat provider publishes for the framework at `row`, by its C
 /// name.
 fn data_symbol(row: usize, name: &str) -> Option<u64> {
+    published_data(name)
+        .filter(|(owner, _)| *owner == row)
+        .map(|(_, addr)| addr)
+}
+
+/// A variable any of these frameworks publishes, by its C name: what
+/// `dlsym(RTLD_DEFAULT)` answers before it looks at the host's libraries.
+pub fn data(name: &str) -> Option<u64> {
+    if !using_builtin() {
+        return None;
+    }
+    published_data(name).map(|(_, addr)| addr)
+}
+
+/// `(row, address)` of the variable `name`, unless it is withheld.
+fn published_data(name: &str) -> Option<(usize, u64)> {
     // Built once: the tables allocate their objects on first use and answer
     // the same addresses after, which is what makes a cache of them correct.
     static DATA: std::sync::OnceLock<std::collections::HashMap<String, (usize, u64)>> =
@@ -1034,9 +1051,7 @@ fn data_symbol(row: usize, name: &str) -> Option<u64> {
     if withheld(&mangled) {
         return None;
     }
-    data.get(&mangled)
-        .filter(|(owner, _)| *owner == row)
-        .map(|&(_, addr)| addr)
+    data.get(&mangled).copied()
 }
 
 pub fn set_main_bundle(executable: &std::path::Path) {

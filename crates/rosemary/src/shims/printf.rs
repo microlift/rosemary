@@ -266,8 +266,115 @@ struct Spec {
     prec: Option<usize>,
 }
 
-/// Format `fmt` against `args`, exactly as C would print it.
+/// An argument a numbered format read ahead of rendering.
+#[derive(Clone, Copy)]
+enum Fetched {
+    Int(u64),
+    Fp(f64),
+}
+
+/// `n` in a `%n$` or `*n$` at `fmt[i..]`, and the index past the `$`.
+fn position_at(fmt: &[u8], i: usize) -> Option<(usize, usize)> {
+    let digits = fmt[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    let n = std::str::from_utf8(&fmt[i..i + digits])
+        .ok()?
+        .parse()
+        .ok()?;
+    (digits > 0 && n > 0 && fmt.get(i + digits) == Some(&b'$')).then_some((n, i + digits + 1))
+}
+
+/// Whether each argument a numbered format names is floating-point, by
+/// position, or `None` for a format that numbers none.
+///
+/// The arguments are fetched in position order before anything is rendered,
+/// because what kind each one is decides where the next one is.
+fn numbered_kinds(fmt: &[u8]) -> Option<Vec<bool>> {
+    let mut kinds: Vec<Option<bool>> = Vec::new();
+    let mut note = |position: usize, fp: bool| {
+        if kinds.len() < position {
+            kinds.resize(position, None);
+        }
+        kinds[position - 1] = Some(fp);
+    };
+    let mut i = 0;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if fmt.get(i) == Some(&b'%') {
+            i += 1;
+            continue;
+        }
+        let position = position_at(fmt, i).map(|(n, after)| {
+            i = after;
+            n
+        });
+        while i < fmt.len() && b"-+ #0'".contains(&fmt[i]) {
+            i += 1;
+        }
+        for _ in 0..2 {
+            if fmt.get(i) == Some(&b'*') {
+                if let Some((n, after)) = position_at(fmt, i + 1) {
+                    note(n, false);
+                    i = after;
+                } else {
+                    i += 1;
+                }
+            }
+            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                i += 1;
+            }
+            if fmt.get(i) == Some(&b'.') {
+                i += 1;
+            }
+        }
+        while i < fmt.len() && b"hlLqjzt".contains(&fmt[i]) {
+            i += 1;
+        }
+        let Some(&conv) = fmt.get(i) else {
+            break;
+        };
+        i += 1;
+        if let Some(n) = position {
+            note(n, b"fFeEgGaA".contains(&conv));
+        }
+    }
+    // An argument no conversion names is still in the list, and its kind is
+    // unknown; an integer slot is the guess C's own `va_arg` walk would make.
+    (!kinds.is_empty()).then(|| kinds.into_iter().map(|k| k.unwrap_or(false)).collect())
+}
+
+/// The integer argument a conversion takes: its numbered one, or the next.
+fn take_int(args: &mut VarArgs<'_>, numbered: &[Fetched], position: Option<usize>) -> Result<u64> {
+    match position.and_then(|n| numbered.get(n - 1)) {
+        Some(Fetched::Int(v)) => Ok(*v),
+        Some(Fetched::Fp(v)) => Ok(v.to_bits()),
+        None => args.next_int(),
+    }
+}
+
+/// The floating-point argument a conversion takes: its numbered one, or the next.
+fn take_fp(args: &mut VarArgs<'_>, numbered: &[Fetched], position: Option<usize>) -> Result<f64> {
+    match position.and_then(|n| numbered.get(n - 1)) {
+        Some(Fetched::Fp(v)) => Ok(*v),
+        Some(Fetched::Int(v)) => Ok(f64::from_bits(*v)),
+        None => args.next_fp(),
+    }
+}
+
+/// Format `fmt` against `args`, exactly as C would print it - numbered
+/// arguments (`%2$d`) included, which a localized format reorders.
 pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
+    let mut numbered = Vec::new();
+    for fp in numbered_kinds(fmt).unwrap_or_default() {
+        numbered.push(match fp {
+            true => Fetched::Fp(args.next_fp()?),
+            false => Fetched::Int(args.next_int()?),
+        });
+    }
+    let numbered = numbered.as_slice();
     let mut out = Vec::with_capacity(fmt.len());
     let mut i = 0usize;
 
@@ -279,6 +386,13 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
         }
         let start = i;
         i += 1;
+        let position = match fmt.get(i) {
+            Some(b'%') => None,
+            _ => position_at(fmt, i).map(|(n, after)| {
+                i = after;
+                n
+            }),
+        };
 
         let mut spec = Spec::default();
         while i < fmt.len() {
@@ -295,7 +409,11 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
 
         if i < fmt.len() && fmt[i] == b'*' {
             i += 1;
-            let w = args.next_int()? as u32 as i32;
+            let at = position_at(fmt, i).map(|(n, after)| {
+                i = after;
+                n
+            });
+            let w = take_int(args, numbered, at)? as u32 as i32;
             if w < 0 {
                 spec.minus = true;
                 spec.width = w.unsigned_abs() as usize;
@@ -313,7 +431,11 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
             i += 1;
             if i < fmt.len() && fmt[i] == b'*' {
                 i += 1;
-                let p = args.next_int()? as u32 as i32;
+                let at = position_at(fmt, i).map(|(n, after)| {
+                    i = after;
+                    n
+                });
+                let p = take_int(args, numbered, at)? as u32 as i32;
                 // A negative `*` precision is as if it were omitted.
                 spec.prec = (p >= 0).then_some(p as usize);
             } else {
@@ -367,18 +489,18 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
             b'%' => out.push(b'%'),
             // Cocoa's object conversion.
             b'@' if args.object.is_some() => {
-                let obj = args.next_int()?;
+                let obj = take_int(args, numbered, position)?;
                 let text = args.object.expect("checked")(obj);
                 pad_bytes(&mut out, &text, &spec);
             }
             b'd' | b'i' => {
-                let v = sign_extend(args.next_int()?, len);
+                let v = sign_extend(take_int(args, numbered, position)?, len);
                 let neg = v < 0;
                 let body = digits_with_precision(v.unsigned_abs(), 10, false, spec.prec);
                 pad_number(&mut out, &body, neg, &spec, "", spec.prec);
             }
             b'u' | b'o' | b'x' | b'X' => {
-                let v = zero_extend(args.next_int()?, len);
+                let v = zero_extend(take_int(args, numbered, position)?, len);
                 let (base, upper) = match conv {
                     b'o' => (8, false),
                     b'x' => (16, false),
@@ -399,17 +521,17 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
             // byte - and come out as UTF-8 because that is what this renderer's
             // output is.
             b'C' | b'c' if len == Len::Long || conv == b'C' => {
-                let v = args.next_int()? as u32;
+                let v = take_int(args, numbered, position)? as u32;
                 let body = char::from_u32(v).map(String::from).unwrap_or_default();
                 pad_bytes(&mut out, body.as_bytes(), &spec);
             }
             b'c' => {
-                let v = args.next_int()? as u8;
+                let v = take_int(args, numbered, position)? as u8;
                 pad_bytes(&mut out, &[v], &spec);
             }
             // `%ls` and `%S` are a `wchar_t *`.
             b'S' | b's' if len == Len::Long || conv == b'S' => {
-                let ptr = args.next_int()?;
+                let ptr = take_int(args, numbered, position)?;
                 let mut s = read_wide_string(args, ptr)?;
                 // A wide string's precision counts *characters*, so it is
                 // applied before the UTF-8 encoding rather than after.
@@ -420,7 +542,7 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
                 pad_bytes(&mut out, body.as_bytes(), &spec);
             }
             b's' => {
-                let ptr = args.next_int()?;
+                let ptr = take_int(args, numbered, position)?;
                 // Read to the NUL first and truncate after.
                 let mut s = read_string(args, ptr)?;
                 if let Some(p) = spec.prec {
@@ -429,7 +551,7 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
                 pad_bytes(&mut out, &s, &spec);
             }
             b'p' => {
-                let v = args.next_int()?;
+                let v = take_int(args, numbered, position)?;
                 // Apple's libc prints `0x0` for null and lower-case hex
                 // otherwise, with no padding of its own.
                 let body = format!("0x{}", String::from_utf8_lossy(&digits(v, 16, false)));
@@ -438,7 +560,7 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
                 pad_bytes(&mut out, body.as_bytes(), &spec);
             }
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
-                let v = args.next_fp()?;
+                let v = take_fp(args, numbered, position)?;
                 let body = format_float(v, conv, &spec);
                 // Darwin prints a NaN with no sign at all, and pads neither a
                 // NaN nor an infinity with zeros.

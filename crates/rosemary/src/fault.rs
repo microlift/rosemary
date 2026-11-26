@@ -343,8 +343,16 @@ pub fn install() {
     // all: glibc's `free(): invalid size` goes to stderr and then straight to
     // `abort`, with no pc, no image and no registers. The handler restores the
     // previous disposition and returns, so the abort still happens - this only
-    // adds the sentence in front of it.
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT] {
+    // adds the sentence in front of it. `SIGTRAP` and `SIGILL` are the
+    // `brk`/`ud2` a compiler emits for a failed check, which otherwise end the
+    // process with nothing but the shell's word for the signal.
+    for signal in [
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGABRT,
+        libc::SIGTRAP,
+        libc::SIGILL,
+    ] {
         // SAFETY: `action` and `old` are live locals of the right type;
         // `sa_sigaction` holds a handler with the `SA_SIGINFO` signature, which
         // is what `SA_SIGINFO` in the flags declares it to be. Installing a
@@ -469,12 +477,27 @@ const fn saved() -> Saved {
 static SEGV: Saved = saved();
 static BUS: Saved = saved();
 static ABRT: Saved = saved();
+static TRAP: Saved = saved();
+static ILL: Saved = saved();
 
 fn saved_for(signal: i32) -> &'static Saved {
     match signal {
         libc::SIGBUS => &BUS,
         libc::SIGABRT => &ABRT,
+        libc::SIGTRAP => &TRAP,
+        libc::SIGILL => &ILL,
         _ => &SEGV,
+    }
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGILL => "SIGILL",
+        _ => "signal",
     }
 }
 
@@ -618,12 +641,7 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         // One line, from the kernel's own words, and out of the way.
         let mut line = Buffer::empty();
         line.str("rosemary: fault: ");
-        line.str(match signal {
-            libc::SIGBUS => "SIGBUS",
-            libc::SIGSEGV => "SIGSEGV",
-            libc::SIGABRT => "SIGABRT",
-            _ => "signal",
-        });
+        line.str(signal_name(signal));
         line.str(" on thread ");
         line.hex(me as u32 as u64);
         line.str(" at host pc ");
@@ -642,12 +660,7 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
     BUILDING.store(true, Ordering::SeqCst);
     stage(0);
     out.str("rosemary: fault: ");
-    out.str(match signal {
-        libc::SIGBUS => "SIGBUS",
-        libc::SIGSEGV => "SIGSEGV",
-        libc::SIGABRT => "SIGABRT",
-        _ => "signal",
-    });
+    out.str(signal_name(signal));
 
     // SAFETY: the kernel passes a live `siginfo_t` for the duration of the
     // handler; `si_addr` is the faulting address for both signals handled here.
@@ -1267,7 +1280,37 @@ fn say_registers(out: &mut Buffer, context: *mut libc::c_void) {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(target_arch = "aarch64")]
+fn say_registers(out: &mut Buffer, context: *mut libc::c_void) {
+    const NAMES: [&str; 31] = [
+        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+        "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
+        "x27", "x28", "fp", "lr",
+    ];
+    // SAFETY: the third argument of this `SA_SIGINFO` handler, which is what
+    // `context` reads; null is answered with `None`.
+    let Some(context) = (unsafe { starnix::signal::context(context) }) else {
+        return;
+    };
+    let registers = NAMES
+        .iter()
+        .zip(context.machine.x)
+        .chain([(&"sp", context.machine.sp)]);
+    for (i, (name, value)) in registers.enumerate() {
+        out.str(match i % 4 {
+            0 => "\n  ",
+            _ => "  ",
+        });
+        out.str(name);
+        out.str("=");
+        out.hex(value);
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    target_arch = "aarch64"
+)))]
 fn say_registers(_out: &mut Buffer, _context: *mut libc::c_void) {}
 
 /// Name the host mapping a `pc` outside any translation fell in.
@@ -1332,8 +1375,31 @@ fn say_host_mapping(out: &mut Buffer, pc: u64) {
     unsafe { libc::close(fd) };
 }
 
+/// The host image and symbol the loader knows `pc` by. Its own table, since
+/// there is no `/proc` here to read.
 #[cfg(not(target_os = "linux"))]
-fn say_host_mapping(_out: &mut Buffer, _pc: u64) {}
+fn say_host_mapping(out: &mut Buffer, pc: u64) {
+    // SAFETY: a zeroed `Dl_info` for `dladdr` to fill; it reads no memory at
+    // `pc` itself, only the loader's own image list.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(pc as usize as *const libc::c_void, &mut info) } == 0 {
+        return;
+    }
+    let text = |p: *const libc::c_char| {
+        // SAFETY: the loader's NUL-terminated strings, or null.
+        (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes())
+    };
+    if let Some(image) = text(info.dli_fname) {
+        out.str("\n  host image ");
+        out.bytes(image);
+    }
+    if let Some(symbol) = text(info.dli_sname) {
+        out.str("\n  host symbol ");
+        out.bytes(symbol);
+        out.str(" +");
+        out.hex(pc.wrapping_sub(info.dli_saddr as usize as u64));
+    }
+}
 
 /// One `/proc/self/maps` line: `lo-hi perms offset dev inode  path`.
 ///

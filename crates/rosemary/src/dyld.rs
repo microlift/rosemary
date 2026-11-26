@@ -640,6 +640,15 @@ mod synthetic {
             .copied()
     }
 
+    /// Whether `path` is, exactly, one of the names a library answers to.
+    pub fn provides_path(path: &str) -> bool {
+        LIBRARIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|l| l.names.iter().any(|n| n == path))
+    }
+
     /// The library a handle names, or `None` for a handle that is not one.
     pub fn by_handle(handle: u64) -> Option<&'static Library> {
         LIBRARIES
@@ -1811,6 +1820,10 @@ fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
     if let Some(addr) = crate::frameworks::symbol(name) {
         return Some(remember_native_symbol(addr, name, None));
     }
+    // And their variables, which are addresses to read rather than to call.
+    if let Some(addr) = crate::frameworks::data(name) {
+        return Some(addr);
+    }
     // Ahead of the native Objective-C runtime's answer, which is a search of
     // every host library.
     if let Some(addr) = crate::gl::host_override(name) {
@@ -2861,6 +2874,31 @@ fn describe(addr: u64) -> Option<Described> {
     }) {
         return Some(found);
     }
+    // The images the launch mapped: under `native` there is no VM to ask, and
+    // an embedded interpreter finds its own home through `dladdr` on itself.
+    if let Some((index, image)) = MAPPED.get().and_then(|images| {
+        images
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.segments.iter().any(|(lo, hi)| addr >= *lo && addr < *hi))
+    }) {
+        let exports = match index {
+            0 => main_exports().map(|m| &m.linked.exports),
+            _ => PROGRAM_IMAGES
+                .get()
+                .and_then(|linked| linked.iter().find(|l| l.path == image.path))
+                .and_then(LinkedImage::exports),
+        };
+        let (sname, saddr) = exports
+            .map(|e| nearest_export(e, image.slide, addr))
+            .unwrap_or((0, 0));
+        return Some(Described {
+            fname: path_cstr(&image.path),
+            fbase: image.header,
+            sname,
+            saddr,
+        });
+    }
     // The main executable, which is a guest image with no `Image` record.
     let vm = crate::thunk::current()?;
     if !vm.program.is_guest_address(addr) {
@@ -3004,6 +3042,37 @@ pub(crate) mod entry {
     /// `bool dyld_shared_cache_some_image_overridden(void)`
     pub extern "C" fn dyld_shared_cache_some_image_overridden() -> bool {
         false
+    }
+
+    /// `bool _dyld_shared_cache_contains_path(const char *path)`
+    ///
+    /// Whether `path` names a library that has no file of its own, which is
+    /// what a program asks before it looks for a system framework on disk.
+    /// The libraries this runtime provides are those; under the host's
+    /// frameworks, the host's cache answers.
+    ///
+    /// # Safety
+    ///
+    /// `path` is null or NUL-terminated.
+    pub unsafe extern "C" fn dyld_shared_cache_contains_path(path: *const c_char) -> bool {
+        if path.is_null() {
+            return false;
+        }
+        // SAFETY: the caller's NUL-terminated string.
+        let text = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+        if text.starts_with('/') && super::synthetic::provides_path(&text) {
+            return true;
+        }
+        if crate::frameworks::using_builtin() {
+            return false;
+        }
+        let Some(host) = crate::host::symbol("_dyld_shared_cache_contains_path") else {
+            return false;
+        };
+        // SAFETY: the host's own function of this signature.
+        let f: unsafe extern "C" fn(*const c_char) -> bool =
+            unsafe { core::mem::transmute(host as usize as *const ()) };
+        unsafe { f(path) }
     }
 
     /// `const void *_dyld_get_shared_cache_range(size_t *length)`
@@ -3622,7 +3691,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 33] {
+fn entries() -> [(&'static str, *const ()); 34] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3679,6 +3748,10 @@ fn entries() -> [(&'static str, *const ()); 33] {
         (
             "_dyld_shared_cache_some_image_overridden",
             entry::dyld_shared_cache_some_image_overridden as *const (),
+        ),
+        (
+            "__dyld_shared_cache_contains_path",
+            entry::dyld_shared_cache_contains_path as *const (),
         ),
         (
             "__dyld_get_shared_cache_range",

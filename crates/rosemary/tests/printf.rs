@@ -364,3 +364,23 @@ fn percent_n_is_not_implemented() {
     // it is visible in the output rather than silently writing memory.
     assert_eq!(shimmed("x%nx", &[V::Int(0)]), "x%nx");
 }
+
+#[test]
+fn numbered_arguments_take_their_own_position() {
+    // A localized format reorders its arguments; each conversion reads the
+    // one it names, whatever order the conversions come in.
+    assert_eq!(
+        shimmed("%2$s is %1$d", &[V::Int(30), V::Str("days")]),
+        "days is 30"
+    );
+    // The kind of each position decides where the next one is: a double in
+    // the middle still leaves the integer after it in an integer register.
+    assert_eq!(
+        shimmed(
+            "%3$d %2$.1f %1$s",
+            &[V::Str("a"), V::Double(1.5), V::Int(7)]
+        ),
+        "7 1.5 a"
+    );
+    assert_eq!(shimmed("%1$*2$d|", &[V::Int(5), V::Int(4)]), "   5|");
+}

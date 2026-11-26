@@ -412,6 +412,12 @@ pub mod native {
         trampoline as *const c_void
     }
 
+    /// The address `_NSLogv` is bound to: Darwin's `va_list` is the tail
+    /// pointer [`render_tail`] already takes, on either architecture.
+    pub fn nslogv() -> *const c_void {
+        render_native as *const c_void
+    }
+
     /// The address `_NSRunAlertPanel` is bound to by the built-in frameworks.
     pub fn run_alert_panel() -> *const c_void {
         alert_trampoline as *const c_void
