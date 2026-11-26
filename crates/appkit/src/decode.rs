@@ -146,6 +146,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSCollectionView" => collection_view(builder, uid),
         "NSSwitch" => switch(builder, uid),
         "NSSplitView" => split_view(builder, uid),
+        "NSStackView" => stack_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         "NSLayoutConstraint" => constraint(builder, uid),
         // Every view archives its frame, flags and subviews, whatever else its
@@ -244,6 +245,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSCollectionViewGridLayout",
     "NSSwitch",
     "NSSplitView",
+    "NSStackView",
     "NSLayoutConstraint",
 ];
 
@@ -526,6 +528,77 @@ fn table_column(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         objc::arc::release(title);
     }
     Some(column)
+}
+
+/// `NSStackView`: a view whose subviews its gravity containers arrange, and
+/// how it arranges them.
+fn stack_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let view = view(builder, uid, "NSStackView")?;
+    // The orientation first: setting it moves the default alignment with it.
+    for (key, selector) in [
+        ("NSStackViewOrientation", "setOrientation:"),
+        ("NSStackViewAlignment", "setAlignment:"),
+        ("NSStackViewdistribution", "setDistribution:"),
+    ] {
+        if let Some(value) = integer(builder, uid, key) {
+            // SAFETY: each setter takes one `NSInteger`.
+            unsafe { send_integer(view, selector, value as usize) };
+        }
+    }
+    if let Some(spacing) = real(builder, uid, "NSStackViewSpacing") {
+        // SAFETY: `-setSpacing:` takes one `CGFloat`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc::msg::entry());
+            f(view, objc::sel::get("setSpacing:"), spacing);
+        }
+    }
+    let inset = |side: &str| real(builder, uid, &format!("NSStackViewEdgeInsets.{side}"));
+    let insets = crate::controls::NSEdgeInsets {
+        top: inset("top").unwrap_or(0.0),
+        left: inset("left").unwrap_or(0.0),
+        bottom: inset("bottom").unwrap_or(0.0),
+        right: inset("right").unwrap_or(0.0),
+    };
+    // SAFETY: `-setEdgeInsets:` takes one `NSEdgeInsets`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, crate::controls::NSEdgeInsets) =
+            std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get("setEdgeInsets:"), insets);
+    }
+    if let Some(detaches) = flag(builder, uid, "NSStackViewDetachesHiddenViews") {
+        // SAFETY: `-setDetachesHiddenViews:` takes one `BOOL`.
+        unsafe { send_flag(view, "setDetachesHiddenViews:", detaches) };
+    }
+    /// `NSStackViewGravity` of each container.
+    const CONTAINERS: [(&str, usize); 3] = [
+        ("NSStackViewBeginningContainer", 1),
+        ("NSStackViewMiddleContainer", 2),
+        ("NSStackViewEndContainer", 3),
+    ];
+    for (key, gravity) in CONTAINERS {
+        let Some(views) = builder
+            .archive()
+            .field_object(uid, key)
+            .and_then(|container| {
+                builder
+                    .archive()
+                    .field_object(container, "NSStackViewContainerNonDroppedViews")
+            })
+        else {
+            continue;
+        };
+        for entry in builder.archive().array(views) {
+            if let Some(arranged) = builder.object_at(entry) {
+                // SAFETY: `-addView:inGravity:` is `void (id, SEL, NSView *, NSStackViewGravity)`.
+                unsafe {
+                    let f: unsafe extern "C" fn(Id, Sel, Id, usize) =
+                        std::mem::transmute(objc::msg::entry());
+                    f(view, objc::sel::get("addView:inGravity:"), arranged, gravity);
+                }
+            }
+        }
+    }
+    Some(view)
 }
 
 /// `NSSplitView`: a view, which way it splits, and its dividers' style.
@@ -1601,8 +1674,11 @@ mod tests {
 </dict>
 </plist>"#;
 
+    /// Builds each entry once, as the nib loader does, so two references to
+    /// one entry are one object.
     struct Test<'a> {
         archive: &'a Archive,
+        built: std::collections::BTreeMap<Uid, Id>,
     }
 
     impl Builder for Test<'_> {
@@ -1610,8 +1686,13 @@ mod tests {
             self.archive
         }
         fn object_at(&mut self, uid: Uid) -> Option<Id> {
+            if let Some(object) = self.built.get(&uid) {
+                return Some(*object);
+            }
             let name = self.archive.class_name(uid)?.to_string();
-            build(self, uid, &name)
+            let object = build(self, uid, &name)?;
+            self.built.insert(uid, object);
+            Some(object)
         }
         fn note_missing(&mut self, name: &str) {
             panic!("nothing implements {name}");
@@ -1622,7 +1703,10 @@ mod tests {
         crate::bootstrap();
         let archive = Archive::parse(archive.as_bytes()).expect("an archive");
         let root = archive.root().expect("a root");
-        let mut builder = Test { archive: &archive };
+        let mut builder = Test {
+            archive: &archive,
+            built: Default::default(),
+        };
         builder.object_at(root).expect("a view")
     }
 
@@ -1682,6 +1766,47 @@ mod tests {
         assert_eq!(class.name_str(), "RosemaryTestSwappedButton");
         assert_eq!(send::<isize>(view, "tag"), 7);
         assert_eq!(frame_of(view).size.height, 40.0);
+    }
+
+    /// A stack view arranges the views its gravity containers list, in their
+    /// gravities, along the orientation and with the spacing it archived.
+    #[test]
+    fn a_stack_view_arranges_its_containers_views() {
+        use crate::fixture::{Field, archive};
+        let stack = decode(&archive(
+            "root",
+            &[
+                (
+                    "NSStackView",
+                    vec![
+                        ("NSFrame", Field::Text("{{0, 0}, {100, 200}}")),
+                        ("NSSubviews", Field::Ref(1)),
+                        ("NSStackViewOrientation", Field::Int(1)),
+                        ("NSStackViewSpacing", Field::Real(5.0)),
+                        ("NSStackViewBeginningContainer", Field::Ref(4)),
+                        ("NSStackViewEndContainer", Field::Ref(6)),
+                    ],
+                ),
+                ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![2, 3]))]),
+                ("NSView", vec![("NSFrame", Field::Text("{{0, 0}, {10, 20}}"))]),
+                ("NSView", vec![("NSFrame", Field::Text("{{0, 0}, {10, 30}}"))]),
+                (
+                    "NSStackViewContainer",
+                    vec![("NSStackViewContainerNonDroppedViews", Field::Ref(5))],
+                ),
+                ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![2]))]),
+                (
+                    "NSStackViewContainer",
+                    vec![("NSStackViewContainerNonDroppedViews", Field::Ref(7))],
+                ),
+                ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![3]))]),
+            ],
+        ));
+        assert_eq!(send::<isize>(stack, "orientation"), 1);
+        assert_eq!(send::<f64>(stack, "spacing"), 5.0);
+        let arranged: Id = send(stack, "arrangedSubviews");
+        assert_eq!(send::<usize>(arranged, "count"), 2);
+        assert!(crate::controls::has_stacks());
     }
 
     /// A view resizes with its superview because the *nib* said so. Nothing
