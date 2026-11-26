@@ -236,6 +236,7 @@ pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
     builder.build_menus(root);
     builder.connect(root);
     builder.show_visible_windows(root);
+    builder.install_constraints();
     builder.awake();
     Ok(builder.loaded)
 }
@@ -480,6 +481,44 @@ impl Builder<'_> {
                     objc::sel::get("makeKeyAndOrderFront:"),
                     std::ptr::null_mut(),
                 );
+            }
+        }
+    }
+
+    /// `-addConstraint:` each view's archived constraints, once every object
+    /// is built: a constraint names the view it belongs to, which is still
+    /// being decoded while its own fields are read. Installing one can build
+    /// more of the nib, so this repeats until nothing new appears.
+    fn install_constraints(&mut self) {
+        let mut done = std::collections::BTreeSet::new();
+        loop {
+            let views: Vec<(Uid, Id)> = self
+                .loaded
+                .objects
+                .iter()
+                .filter(|(uid, _)| !done.contains(*uid))
+                .map(|(uid, object)| (*uid, *object))
+                .collect();
+            if views.is_empty() {
+                return;
+            }
+            for (uid, view) in views {
+                done.insert(uid);
+                let Some(list) = self.archive.field_object(uid, "NSViewConstraints") else {
+                    continue;
+                };
+                for entry in self.archive.array(list) {
+                    let Some(constraint) = self.instantiate(entry) else {
+                        continue;
+                    };
+                    // SAFETY: `-addConstraint:` is `void (id, SEL, NSLayoutConstraint *)`,
+                    // which every view answers.
+                    unsafe {
+                        let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                            std::mem::transmute(objc::msg::entry());
+                        f(view, objc::sel::get("addConstraint:"), constraint);
+                    }
+                }
             }
         }
     }
@@ -888,6 +927,101 @@ mod tests {
             std::env::temp_dir().join(format!("rosemary-nib-{}-{name}.nib", std::process::id()));
         std::fs::write(&path, nib).expect("writable");
         path
+    }
+
+    fn send<R>(receiver: Id, selector: &str) -> R {
+        // SAFETY: every selector this reads is a nullary accessor.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> R =
+                std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(selector))
+        }
+    }
+
+    /// Each view's archived constraints are installed on it, with Interface
+    /// Builder's standard space between a view and its superview.
+    #[test]
+    fn a_views_archived_constraints_are_installed_on_it() {
+        use crate::fixture::{Field, archive};
+        crate::bootstrap();
+        let nib = archive(
+            "IB.objectdata",
+            &[
+                (
+                    "NSIBObjectData",
+                    vec![("NSRoot", Field::Ref(1)), ("NSConnections", Field::Ref(2))],
+                ),
+                ("NSCustomObject", vec![("NSClassName", Field::Text("NSView"))]),
+                ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![3]))]),
+                (
+                    "NSNibOutletConnector",
+                    vec![
+                        ("NSSource", Field::Ref(1)),
+                        ("NSDestination", Field::Ref(4)),
+                        ("NSLabel", Field::Text("nextKeyView")),
+                    ],
+                ),
+                (
+                    "NSView",
+                    vec![
+                        ("NSFrame", Field::Text("{{0, 0}, {200, 100}}")),
+                        ("NSSubviews", Field::Ref(5)),
+                        ("NSViewConstraints", Field::Ref(7)),
+                    ],
+                ),
+                ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![6]))]),
+                (
+                    "NSView",
+                    vec![
+                        ("NSFrame", Field::Text("{{10, 10}, {50, 20}}")),
+                        ("NSDoNotTranslateAutoresizingMask", Field::Bool(true)),
+                    ],
+                ),
+                ("NSArray", vec![("NS.objects", Field::Refs(vec![8, 9]))]),
+                (
+                    "NSLayoutConstraint",
+                    vec![
+                        ("NSFirstItem", Field::Ref(6)),
+                        ("NSFirstAttribute", Field::Int(7)),
+                        ("NSConstant", Field::Real(42.0)),
+                    ],
+                ),
+                (
+                    "NSLayoutConstraint",
+                    vec![
+                        ("NSFirstItem", Field::Ref(6)),
+                        ("NSFirstAttribute", Field::Int(5)),
+                        ("NSSecondItem", Field::Ref(4)),
+                        ("NSSecondAttribute", Field::Int(5)),
+                        ("NSSymbolicConstant", Field::Text("NSSpace")),
+                    ],
+                ),
+            ],
+        );
+        let owner: Id = send(
+            send::<Id>(
+                objc::class::ptr(objc::class::lookup(c"NSView").expect("NSView")) as Id,
+                "alloc",
+            ),
+            "init",
+        );
+        let path = write("constraints", &nib);
+        load(&path, owner).expect("a nib");
+        let _ = std::fs::remove_file(&path);
+
+        let outer: Id = send(owner, "nextKeyView");
+        let constraints: Id = send(outer, "constraints");
+        assert_eq!(send::<usize>(constraints, "count"), 2);
+        // SAFETY: `-objectAtIndex:` is `id (id, SEL, NSUInteger)`.
+        let at = |index: usize| unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(constraints, objc::sel::get("objectAtIndex:"), index)
+        };
+        let inner: Id = send(at(0), "firstItem");
+        assert_eq!(send::<u8>(inner, "translatesAutoresizingMaskIntoConstraints"), 0);
+        let constants: Vec<f64> = (0..2).map(|i| send(at(i), "constant")).collect();
+        assert!(constants.contains(&42.0) && constants.contains(&20.0), "{constants:?}");
     }
 
     #[test]

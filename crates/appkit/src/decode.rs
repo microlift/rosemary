@@ -147,6 +147,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSSwitch" => switch(builder, uid),
         "NSSplitView" => split_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
+        "NSLayoutConstraint" => constraint(builder, uid),
         // Every view archives its frame, flags and subviews, whatever else its
         // class adds.
         other if is_view_class(other) => view(builder, uid, other),
@@ -243,6 +244,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSCollectionViewGridLayout",
     "NSSwitch",
     "NSSplitView",
+    "NSLayoutConstraint",
 ];
 
 /// A boolean field, which an archive writes as a boolean or as an integer.
@@ -1446,6 +1448,30 @@ fn view(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
         unsafe { send_object(view, "setIdentifier:", identifier) };
         objc::arc::release(identifier);
     }
+    if flag(builder, uid, "NSDoNotTranslateAutoresizingMask") == Some(true) {
+        // SAFETY: `-setTranslatesAutoresizingMaskIntoConstraints:` takes one `BOOL`.
+        unsafe { send_flag(view, "setTranslatesAutoresizingMaskIntoConstraints:", false) };
+    }
+    // Each is `{horizontal, vertical}`.
+    for (key, selector) in [
+        ("NSHuggingPriority", "setContentHuggingPriority:forOrientation:"),
+        (
+            "NSAntiCompressionPriority",
+            "setContentCompressionResistancePriority:forOrientation:",
+        ),
+    ] {
+        let Some(priorities) = text(builder, uid, key).and_then(size) else {
+            continue;
+        };
+        for (priority, orientation) in [(priorities.width, 0isize), (priorities.height, 1)] {
+            // SAFETY: `void (id, SEL, NSLayoutPriority, NSLayoutConstraintOrientation)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, f32, isize) =
+                    std::mem::transmute(objc::msg::entry());
+                f(view, objc::sel::get(selector), priority as f32, orientation);
+            }
+        }
+    }
 
     if let Some(subviews) = builder.archive().field_object(uid, "NSSubviews") {
         for entry in builder.archive().array(subviews) {
@@ -1456,6 +1482,67 @@ fn view(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
         }
     }
     Some(view)
+}
+
+/// `NSLayoutConstraint`: one item's attribute related to another's, or to a
+/// constant. Its view installs it once the whole nib is built, since a
+/// constraint names the view that is decoding it.
+fn constraint(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let item = |builder: &mut dyn Builder, key: &str| {
+        builder
+            .archive()
+            .field_object(uid, key)
+            .and_then(|item| builder.object_at(item))
+            .unwrap_or(std::ptr::null_mut())
+    };
+    let (first, second) = (item(builder, "NSFirstItem"), item(builder, "NSSecondItem"));
+    if first.is_null() {
+        return None;
+    }
+    let attribute = |builder: &dyn Builder, key: &str| {
+        integer(builder, uid, &format!("{key}V2"))
+            .or_else(|| integer(builder, uid, key))
+            .unwrap_or(0) as isize
+    };
+    let first_attribute = attribute(builder, "NSFirstAttribute");
+    let second_attribute = attribute(builder, "NSSecondAttribute");
+    let constant = match text(builder, uid, "NSSymbolicConstant") {
+        Some("NSSpace") => standard_spacing(first, second),
+        Some(other) => objc::fail!("an NSLayoutConstraint with the symbolic constant {other:?}"),
+        None => real(builder, uid, "NSConstantV2")
+            .or_else(|| real(builder, uid, "NSConstant"))
+            .unwrap_or(0.0),
+    };
+    let constraint = crate::layout::new_constraint(
+        (first, first_attribute),
+        integer(builder, uid, "NSRelation").unwrap_or(0) as isize,
+        (second, second_attribute),
+        real(builder, uid, "NSMultiplier").unwrap_or(1.0),
+        constant,
+    );
+    if let Some(priority) = real(builder, uid, "NSPriority") {
+        crate::layout::set_priority_of(constraint, priority as f32);
+    }
+    Some(objc::arc::retain(constraint))
+}
+
+/// The standard space Interface Builder's `NSSpace` stands for: from a view
+/// to its superview's edge, or between siblings.
+///
+/// FIXME (ACCURACY): AppKit's standard spacing also depends on the kinds of
+/// views on either side; only the superview/sibling distinction is made here.
+fn standard_spacing(first: Id, second: Id) -> f64 {
+    const TO_SUPERVIEW: f64 = 20.0;
+    const BETWEEN_SIBLINGS: f64 = 8.0;
+    // SAFETY: views of this crate's, or nil.
+    let contains = |outer: Id, inner: Id| unsafe { crate::view::superview_of(inner) } == outer;
+    match crate::view::is_view(first)
+        && crate::view::is_view(second)
+        && (contains(first, second) || contains(second, first))
+    {
+        true => TO_SUPERVIEW,
+        false => BETWEEN_SIBLINGS,
+    }
 }
 
 #[cfg(test)]
