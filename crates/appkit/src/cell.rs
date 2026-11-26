@@ -494,6 +494,34 @@ unsafe extern "C" fn cell_size_for_bounds(
     }
 }
 
+/// `-expansionFrameWithFrame:inView:`: where the whole of a cell's contents
+/// would show when `frame` cuts them off, or the zero rect when they fit.
+unsafe extern "C" fn expansion_frame_with_frame(
+    receiver: Id,
+    sel: Sel,
+    frame: foundation::geometry::NSRect,
+    _view: Id,
+) -> foundation::geometry::NSRect {
+    // SAFETY: an instance of a class laid out as `Cell`.
+    let control = unsafe { (*(receiver as *const Cell)).control };
+    let wanted = match control.is_null() {
+        true => None,
+        false => crate::label::full_size(control, frame.size.width),
+    }
+    // SAFETY: the same receiver.
+    .unwrap_or_else(|| unsafe { cell_size(receiver, sel) });
+    if wanted.width <= frame.size.width && wanted.height <= frame.size.height {
+        return foundation::geometry::NSRect::default();
+    }
+    foundation::geometry::NSRect {
+        origin: frame.origin,
+        size: foundation::geometry::NSSize {
+            width: wanted.width.max(frame.size.width),
+            height: wanted.height.max(frame.size.height),
+        },
+    }
+}
+
 unsafe extern "C" fn cell_size(receiver: Id, sel: Sel) -> foundation::geometry::NSSize {
     let unbounded = foundation::geometry::NSRect {
         origin: Default::default(),
@@ -950,6 +978,8 @@ pub(crate) fn install() {
         "cellSizeForBounds:" => cell_size_for_bounds,
             c"{CGSize=dd}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "cellSize" => cell_size, c"{CGSize=dd}16@0:8";
+        "expansionFrameWithFrame:inView:" => expansion_frame_with_frame,
+        c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
         "controlSize" => control_size, c"Q16@0:8";
         "setControlSize:" => set_control_size, c"v24@0:8Q16";
         "bezelStyle" => bezel_style, c"Q16@0:8";

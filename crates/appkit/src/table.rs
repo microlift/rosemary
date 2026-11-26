@@ -702,6 +702,20 @@ unsafe extern "C" fn header_draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
     );
 }
 
+/// `-sortDescriptors`: none until some are set.
+unsafe extern "C" fn sort_descriptors(receiver: Id, _sel: Sel) -> Id {
+    let kept = crate::props::object(receiver, "sortDescriptors");
+    if !kept.is_null() {
+        return kept;
+    }
+    // SAFETY: `+[NSArray array]`.
+    unsafe {
+        let class = objc::class::lookup(c"NSArray").expect("NSArray");
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(objc::class::ptr(class) as Id, objc::sel::get("array"))
+    }
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSTableHeaderView").expect("declared in crate::classes");
     methods!(class, {
@@ -742,6 +756,10 @@ pub(crate) fn install() {
         "setHeaderView:" => set_header_view, c"v24@0:8@16";
         "headerView" => header_view, c"@16@0:8";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        // FIXME (ACCURACY): kept only: a header click sorts nothing, and the
+        // data source is not told the descriptors changed.
+        "sortDescriptors" => sort_descriptors, c"@16@0:8";
+        "setSortDescriptors:" => crate::props::set_copied, c"v24@0:8@16";
     });
     let column_class = objc::class::lookup(c"NSTableColumn").expect("declared in crate::classes");
     methods!(column_class, {

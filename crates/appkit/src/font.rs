@@ -93,6 +93,20 @@ unsafe extern "C" fn system_font_of_size(_class: Id, _sel: Sel, size: f64) -> Id
     unsafe { autorelease(font) }
 }
 
+/// `+systemFontOfSize:weight:`.
+///
+/// FIXME (ACCURACY): the weight picks nothing here, as there is one system
+/// face; a semibold or bold weight draws regular.
+unsafe extern "C" fn system_font_of_size_weight(
+    class: Id,
+    sel: Sel,
+    size: f64,
+    _weight: f64,
+) -> Id {
+    // SAFETY: the same arguments the one-size form takes.
+    unsafe { system_font_of_size(class, sel, size) }
+}
+
 /// `+userFixedPitchFontOfSize:`, the monospaced `kCTFontUIFontUserFixedPitch`.
 unsafe extern "C" fn user_fixed_pitch_font_of_size(_class: Id, _sel: Sel, size: f64) -> Id {
     // SAFETY: `kCTFontUIFontUserFixedPitch` with no language.
@@ -402,6 +416,7 @@ pub(crate) fn install() {
         "fontWithName:size:" => font_with_name, c"@32@0:8@16d24";
         "fontWithDescriptor:size:" => font_with_descriptor, c"@32@0:8@16d24";
         "systemFontOfSize:" => system_font_of_size, c"@24@0:8d16";
+        "systemFontOfSize:weight:" => system_font_of_size_weight, c"@32@0:8d16d24";
         "boldSystemFontOfSize:" => system_font_of_size, c"@24@0:8d16";
         "userFontOfSize:" => system_font_of_size, c"@24@0:8d16";
         "messageFontOfSize:" => system_font_of_size, c"@24@0:8d16";

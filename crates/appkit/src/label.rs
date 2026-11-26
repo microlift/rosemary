@@ -181,19 +181,31 @@ pub(crate) fn intrinsic_size(receiver: Id) -> Option<NSSize> {
 /// wrapping field breaks its text to the width of `bounds` and is as tall as
 /// its lines.
 pub(crate) fn cell_size(receiver: Id, bounds: NSRect) -> Option<NSSize> {
+    sized(receiver, bounds.size.width, true)
+}
+
+/// The size the whole text wants at `width`, however many lines the field
+/// shows: what `-expansionFrameWithFrame:inView:` compares against.
+pub(crate) fn full_size(receiver: Id, width: f64) -> Option<NSSize> {
+    sized(receiver, width, false)
+}
+
+/// The text's size wrapped at `width`, cut to the field's maximum number of
+/// lines when `limited`.
+fn sized(receiver: Id, width: f64, limited: bool) -> Option<NSSize> {
     let natural = intrinsic_size(receiver)?;
     let look = look(receiver);
-    if !look.wraps() || natural.width <= bounds.size.width {
+    if !look.wraps() || natural.width <= width {
         return Some(natural);
     }
     let (font, size) = font_of(&look)?;
-    let room = (bounds.size.width - 2.0 * PADDING).max(0.0) as f32;
+    let room = (width - 2.0 * PADDING).max(0.0) as f32;
     let text = crate::text::field_text(receiver);
     let mut lines = match look.line_break {
         CHAR_WRAP => char_wrap(&font, &text, size as f32, room),
         _ => font.wrap(&text, size as f32, room),
     };
-    if look.max_lines > 0 {
+    if limited && look.max_lines > 0 {
         lines.truncate(look.max_lines as usize);
     }
     let widest = lines
