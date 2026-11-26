@@ -120,6 +120,38 @@ fn autoreleased_request(url: Id, timeout: f64) -> Id {
     objc::arc::autorelease(make(request_class(), Request::new(text, timeout)))
 }
 
+/// `-initWithURL:cachePolicy:timeoutInterval:`, for a request a guest
+/// allocated itself; the shorter forms take Apple's defaults.
+unsafe extern "C" fn init_with_url_policy_timeout(
+    receiver: Id,
+    _sel: Sel,
+    url: Id,
+    policy: usize,
+    timeout: f64,
+) -> Id {
+    // SAFETY: an `NSURL`, or nil, which makes a request with no URL.
+    let text = unsafe { crate::url::text_of(url) }.unwrap_or_default();
+    let timeout = match timeout > 0.0 {
+        true => timeout,
+        false => DEFAULT_TIMEOUT_SECONDS,
+    };
+    let mut request = Request::new(text, timeout);
+    request.cache_policy = policy;
+    // SAFETY: an instance of a request class, allocated and still empty.
+    unsafe { crate::boxed::fill(receiver, request) };
+    receiver
+}
+
+unsafe extern "C" fn init_with_url(receiver: Id, sel: Sel, url: Id) -> Id {
+    // SAFETY: the same receiver, with the default policy and timeout.
+    unsafe { init_with_url_policy_timeout(receiver, sel, url, 0, DEFAULT_TIMEOUT_SECONDS) }
+}
+
+unsafe extern "C" fn init_request(receiver: Id, sel: Sel) -> Id {
+    // SAFETY: as above, with no URL.
+    unsafe { init_with_url(receiver, sel, std::ptr::null_mut()) }
+}
+
 /// A new autoreleased request for `url`, for a framework handing a guest the
 /// request something else is making.
 pub fn request_for(url: &str) -> Id {
@@ -388,6 +420,58 @@ unsafe extern "C" fn response_url(receiver: Id, _sel: Sel) -> Id {
     };
     // SAFETY: a URL this call just made.
     unsafe { corefoundation::api::CFAutorelease(corefoundation::url::new(&response.url)) as Id }
+}
+
+/// The name a download of `url` should be saved under: the
+/// `Content-Disposition` header's, the URL's last path component, its host,
+/// or `Unknown`, in Apple's documented order.
+///
+/// FIXME (ACCURACY): Apple also adds the extension the MIME type implies to
+/// a name with none; this does not.
+fn suggested_filename(headers: &[(String, String)], url: &str) -> String {
+    let disposition = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-disposition"))
+        .map(|(_, value)| value.as_str());
+    let from_header = disposition.and_then(|value| {
+        value.split(';').map(str::trim).find_map(|part| {
+            let (key, name) = part.split_once('=')?;
+            let name = name.trim().trim_matches('"');
+            match key.trim().to_ascii_lowercase().as_str() {
+                // RFC 5987: `charset'language'percent-encoded`.
+                "filename*" => name
+                    .splitn(3, '\'')
+                    .nth(2)
+                    .map(|n| corefoundation::url::percent_decode(n, &[])),
+                "filename" => Some(name.to_string()),
+                _ => None,
+            }
+        })
+    });
+    // The last path component wins over the bare host; neither keeps a
+    // directory a header might name.
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let without_query = after_scheme.split(['?', '#']).next().unwrap_or("");
+    let (host, path) = without_query.split_once('/').unwrap_or((without_query, ""));
+    let last = path.rsplit('/').find(|c| !c.is_empty());
+    [
+        from_header,
+        last.map(|c| corefoundation::url::percent_decode(c, &[])),
+        Some(host.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|name| name.rsplit(['/', '\\']).next().unwrap_or("").to_string())
+    .find(|name| !name.is_empty())
+    .unwrap_or_else(|| String::from("Unknown"))
+}
+
+unsafe extern "C" fn suggested_filename_of(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: the receiver is a response this module made.
+    let Some(response) = (unsafe { response_of(receiver) }) else {
+        return std::ptr::null_mut();
+    };
+    autoreleased_string(&suggested_filename(&response.headers, &response.url))
 }
 
 unsafe extern "C" fn mime_type(receiver: Id, _sel: Sel) -> Id {
@@ -724,6 +808,13 @@ unsafe extern "C" fn resume(receiver: Id, _sel: Sel) {
                     );
                 }
             }
+        } else if completion == 0 && delegate != 0 {
+            deliver(
+                delegate as Id,
+                session as Id,
+                task_id as Id,
+                perform(&request),
+            );
         } else {
             let (data, response, error) = objects(perform(&request));
             // SAFETY: the block was retained when the task was made.
@@ -735,6 +826,345 @@ unsafe extern "C" fn resume(receiver: Id, _sel: Sel) {
         objc::arc::release(session as Id);
         objc::arc::release(task_id as Id);
     });
+}
+
+/// `NSURLSessionResponseDisposition`.
+const RESPONSE_CANCEL: isize = 0;
+const RESPONSE_ALLOW: isize = 1;
+
+/// `NSURLErrorCancelled`.
+const NSURL_ERROR_CANCELLED: i64 = -999;
+
+fn responds(object: Id, sel: &str) -> bool {
+    // SAFETY: a live object or nil.
+    !object.is_null()
+        && unsafe { objc::object::class_of(object) }
+            .is_some_and(|c| c.method(objc::sel::get(sel)).is_some())
+}
+
+/// A data task's delegate is told of the response, then of the data, then
+/// that the task completed.
+///
+/// FIXME (ACCURACY): the body is read whole before the delegate hears of the
+/// response, and arrives in one `-URLSession:dataTask:didReceiveData:`.
+fn deliver(delegate: Id, session: Id, task: Id, result: Result<(Response, Vec<u8>), String>) {
+    let error = match result {
+        Err(message) => crate::error::make(
+            crate::error::NSURL_ERROR_DOMAIN,
+            crate::error::NSURL_ERROR_UNKNOWN,
+            &message,
+        ),
+        Ok((response, bytes)) => {
+            let response = make(response_class(), response);
+            // SAFETY: the task is retained for the duration of this worker.
+            if let Some(state) = unsafe { contents::<Task>(task, task_class()) } {
+                let old = state
+                    .response
+                    .swap(response as usize, std::sync::atomic::Ordering::AcqRel);
+                objc::arc::release(old as Id);
+            }
+            match disposition(delegate, session, task, response) {
+                RESPONSE_ALLOW => {
+                    if !bytes.is_empty()
+                        && responds(delegate, "URLSession:dataTask:didReceiveData:")
+                    {
+                        let data = corefoundation::collections::new_data(bytes);
+                        // SAFETY: `void (id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *)`.
+                        unsafe {
+                            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
+                                std::mem::transmute(objc::msg::entry());
+                            f(
+                                delegate,
+                                objc::sel::get("URLSession:dataTask:didReceiveData:"),
+                                session,
+                                task,
+                                data as Id,
+                            );
+                            corefoundation::api::CFRelease(data);
+                        }
+                    }
+                    std::ptr::null_mut()
+                }
+                RESPONSE_CANCEL => crate::error::make(
+                    crate::error::NSURL_ERROR_DOMAIN,
+                    NSURL_ERROR_CANCELLED,
+                    "cancelled",
+                ),
+                other => objc::fail!(
+                    "NSURLSession: the delegate turned a data task into disposition {other}, which is not implemented"
+                ),
+            }
+        }
+    };
+    if responds(delegate, "URLSession:task:didCompleteWithError:") {
+        // SAFETY: `void (id, SEL, NSURLSession *, NSURLSessionTask *, NSError *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                delegate,
+                objc::sel::get("URLSession:task:didCompleteWithError:"),
+                session,
+                task,
+                error,
+            );
+        }
+    }
+}
+
+// NSURLSessionConfiguration.
+
+/// Apple's defaults: a minute's wait for a request, a week for a resource.
+const DEFAULT_RESOURCE_TIMEOUT_SECONDS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+
+struct Configuration {
+    /// Retained dictionary, or zero.
+    additional_headers: usize,
+    request_timeout: f64,
+    resource_timeout: f64,
+    /// Retained `NSHTTPCookieStorage`, or zero.
+    cookie_storage: usize,
+    should_set_cookies: bool,
+    cache_policy: usize,
+}
+
+impl Configuration {
+    fn new() -> Configuration {
+        Configuration {
+            additional_headers: 0,
+            request_timeout: DEFAULT_TIMEOUT_SECONDS,
+            resource_timeout: DEFAULT_RESOURCE_TIMEOUT_SECONDS,
+            cookie_storage: 0,
+            should_set_cookies: true,
+            cache_policy: 0,
+        }
+    }
+}
+
+impl Clone for Configuration {
+    fn clone(&self) -> Configuration {
+        Configuration {
+            additional_headers: objc::arc::retain(self.additional_headers as Id) as usize,
+            cookie_storage: objc::arc::retain(self.cookie_storage as Id) as usize,
+            ..*self
+        }
+    }
+}
+
+impl Drop for Configuration {
+    fn drop(&mut self) {
+        objc::arc::release(self.additional_headers as Id);
+        objc::arc::release(self.cookie_storage as Id);
+    }
+}
+
+fn configuration_class() -> &'static Class {
+    register::<Configuration>(c"NSURLSessionConfiguration", None)
+}
+
+fn configuration_of<'a>(receiver: Id) -> Option<&'a mut Configuration> {
+    // SAFETY: a configuration this module made, or anything else.
+    unsafe { contents::<Configuration>(receiver, configuration_class()) }
+}
+
+/// The configuration a session made without one has.
+fn default_configuration() -> Id {
+    objc::arc::autorelease(make(configuration_class(), Configuration::new()))
+}
+
+/// `+defaultSessionConfiguration`, and `+ephemeralSessionConfiguration`.
+///
+/// FIXME (ACCURACY): nothing is cached or kept on disk here, so the two
+/// differ in nothing this runtime does.
+unsafe extern "C" fn new_configuration(_class: Id, _sel: Sel) -> Id {
+    default_configuration()
+}
+
+unsafe extern "C" fn configuration_copy(
+    receiver: Id,
+    _sel: Sel,
+    _zone: *mut std::ffi::c_void,
+) -> Id {
+    match configuration_of(receiver) {
+        Some(configuration) => make(configuration_class(), configuration.clone()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+unsafe extern "C" fn additional_headers(receiver: Id, _sel: Sel) -> Id {
+    configuration_of(receiver).map_or(std::ptr::null_mut(), |c| c.additional_headers as Id)
+}
+
+unsafe extern "C" fn set_additional_headers(receiver: Id, _sel: Sel, headers: Id) {
+    if let Some(configuration) = configuration_of(receiver) {
+        let copy = match headers.is_null() {
+            true => 0,
+            false => send_copy(headers) as usize,
+        };
+        objc::arc::release(std::mem::replace(&mut configuration.additional_headers, copy) as Id);
+    }
+}
+
+unsafe extern "C" fn request_timeout(receiver: Id, _sel: Sel) -> f64 {
+    configuration_of(receiver).map_or(DEFAULT_TIMEOUT_SECONDS, |c| c.request_timeout)
+}
+
+unsafe extern "C" fn set_request_timeout(receiver: Id, _sel: Sel, seconds: f64) {
+    if let Some(configuration) = configuration_of(receiver) {
+        configuration.request_timeout = seconds;
+    }
+}
+
+unsafe extern "C" fn resource_timeout(receiver: Id, _sel: Sel) -> f64 {
+    configuration_of(receiver).map_or(DEFAULT_RESOURCE_TIMEOUT_SECONDS, |c| c.resource_timeout)
+}
+
+unsafe extern "C" fn set_resource_timeout(receiver: Id, _sel: Sel, seconds: f64) {
+    if let Some(configuration) = configuration_of(receiver) {
+        configuration.resource_timeout = seconds;
+    }
+}
+
+unsafe extern "C" fn cookie_storage(receiver: Id, _sel: Sel) -> Id {
+    configuration_of(receiver).map_or(std::ptr::null_mut(), |c| c.cookie_storage as Id)
+}
+
+/// FIXME (ACCURACY): kept only: no cookie is sent from or saved to it.
+unsafe extern "C" fn set_cookie_storage(receiver: Id, _sel: Sel, storage: Id) {
+    if let Some(configuration) = configuration_of(receiver) {
+        let kept = objc::arc::retain(storage) as usize;
+        objc::arc::release(std::mem::replace(&mut configuration.cookie_storage, kept) as Id);
+    }
+}
+
+unsafe extern "C" fn should_set_cookies(receiver: Id, _sel: Sel) -> u8 {
+    configuration_of(receiver).is_none_or(|c| c.should_set_cookies) as u8
+}
+
+unsafe extern "C" fn set_should_set_cookies(receiver: Id, _sel: Sel, flag: u8) {
+    if let Some(configuration) = configuration_of(receiver) {
+        configuration.should_set_cookies = flag != 0;
+    }
+}
+
+unsafe extern "C" fn configuration_cache_policy(receiver: Id, _sel: Sel) -> usize {
+    configuration_of(receiver).map_or(0, |c| c.cache_policy)
+}
+
+/// FIXME (ACCURACY): kept only; nothing here caches.
+unsafe extern "C" fn set_configuration_cache_policy(receiver: Id, _sel: Sel, policy: usize) {
+    if let Some(configuration) = configuration_of(receiver) {
+        configuration.cache_policy = policy;
+    }
+}
+
+fn install_configuration() {
+    let class = configuration_class();
+    class_methods!(class, {
+        "defaultSessionConfiguration" => new_configuration, c"@16@0:8";
+        "ephemeralSessionConfiguration" => new_configuration, c"@16@0:8";
+    });
+    methods!(class, {
+        "copyWithZone:" => configuration_copy, c"@24@0:8^v16";
+        "HTTPAdditionalHeaders" => additional_headers, c"@16@0:8";
+        "setHTTPAdditionalHeaders:" => set_additional_headers, c"v24@0:8@16";
+        "timeoutIntervalForRequest" => request_timeout, c"d16@0:8";
+        "setTimeoutIntervalForRequest:" => set_request_timeout, c"v24@0:8d16";
+        "timeoutIntervalForResource" => resource_timeout, c"d16@0:8";
+        "setTimeoutIntervalForResource:" => set_resource_timeout, c"v24@0:8d16";
+        "HTTPCookieStorage" => cookie_storage, c"@16@0:8";
+        "setHTTPCookieStorage:" => set_cookie_storage, c"v24@0:8@16";
+        "HTTPShouldSetCookies" => should_set_cookies, c"c16@0:8";
+        "setHTTPShouldSetCookies:" => set_should_set_cookies, c"v20@0:8c16";
+        "requestCachePolicy" => configuration_cache_policy, c"Q16@0:8";
+        "setRequestCachePolicy:" => set_configuration_cache_policy, c"v24@0:8Q16";
+    });
+}
+
+/// The block `-URLSession:dataTask:didReceiveResponse:completionHandler:`
+/// is handed, laid out as a block literal with the answer it waits for
+/// after it.
+///
+/// Global, so copying and releasing it are nothing; it lives until the task
+/// completes, which is as long as a delegate may hold on to it. Its `invoke`
+/// is native code, which a native guest calls directly.
+#[repr(C)]
+struct DispositionBlock {
+    isa: *const std::ffi::c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*const DispositionBlock, isize),
+    descriptor: &'static BlockDescriptor,
+    answer: (std::sync::Mutex<Option<isize>>, std::sync::Condvar),
+}
+
+#[repr(C)]
+struct BlockDescriptor {
+    reserved: u64,
+    size: u64,
+    signature: *const std::ffi::c_char,
+}
+
+// SAFETY: immutable, and its one pointer is to a static string.
+unsafe impl Sync for BlockDescriptor {}
+
+/// `BLOCK_IS_GLOBAL | BLOCK_HAS_SIGNATURE`.
+const GLOBAL_WITH_SIGNATURE: i32 = (1 << 28) | (1 << 30);
+
+static DISPOSITION_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: size_of::<DispositionBlock>() as u64,
+    // `void (^)(NSURLSessionResponseDisposition)`.
+    signature: c"v16@?0q8".as_ptr(),
+};
+
+unsafe extern "C" fn answer_disposition(block: *const DispositionBlock, disposition: isize) {
+    // SAFETY: the block `disposition` made, alive until the task completes.
+    let (answer, ready) = unsafe { &(*block).answer };
+    *answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(disposition);
+    ready.notify_all();
+}
+
+/// What the delegate wants done with `response`: allowed, if it does not say.
+/// The task waits for the answer, which a delegate may give later.
+fn disposition(delegate: Id, session: Id, task: Id, response: Id) -> isize {
+    const SELECTOR: &str = "URLSession:dataTask:didReceiveResponse:completionHandler:";
+    if !responds(delegate, SELECTOR) {
+        return RESPONSE_ALLOW;
+    }
+    let isa = objc::class::lookup(c"__NSGlobalBlock__")
+        .map(|class| objc::class::ptr(class) as *const std::ffi::c_void)
+        .expect("registered by objc::block");
+    let block = Box::new(DispositionBlock {
+        isa,
+        flags: GLOBAL_WITH_SIGNATURE,
+        reserved: 0,
+        invoke: answer_disposition,
+        descriptor: &DISPOSITION_DESCRIPTOR,
+        answer: Default::default(),
+    });
+    // SAFETY: `void (id, SEL, NSURLSession *, NSURLSessionDataTask *,
+    // NSURLResponse *, void (^)(NSURLSessionResponseDisposition))`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id, Id) =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            delegate,
+            objc::sel::get(SELECTOR),
+            session,
+            task,
+            response,
+            &*block as *const DispositionBlock as Id,
+        );
+    }
+    let (answer, ready) = &block.answer;
+    let mut answer = answer.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(disposition) = *answer {
+            return disposition;
+        }
+        answer = ready.wait(answer).unwrap_or_else(|e| e.into_inner());
+    }
 }
 
 /// `-cancel`, which cannot stop a request already in flight.
@@ -793,10 +1223,14 @@ fn session_class() -> &'static Class {
 
 struct Session {
     delegate: usize,
+    /// A retained copy of the configuration the session was made with, or
+    /// zero for the shared session's defaults.
+    configuration: usize,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        objc::arc::release(self.configuration as Id);
         objc::arc::release(self.delegate as Id);
     }
 }
@@ -807,7 +1241,13 @@ impl Drop for Session {
 unsafe extern "C" fn shared_session(_class: Id, _sel: Sel) -> Id {
     static SESSION: OnceLock<usize> = OnceLock::new();
     *SESSION.get_or_init(|| {
-        let session = make(session_class(), Session { delegate: 0 });
+        let session = make(
+            session_class(),
+            Session {
+                delegate: 0,
+                configuration: 0,
+            },
+        );
         // Retained forever: a singleton a guest can release is one it can make
         // dangle by releasing what it never owned.
         objc::arc::make_immortal(session);
@@ -815,31 +1255,119 @@ unsafe extern "C" fn shared_session(_class: Id, _sel: Sel) -> Id {
     }) as Id
 }
 
-unsafe extern "C" fn session_with_configuration(class: Id, sel: Sel, _configuration: Id) -> Id {
-    // SAFETY: `+sharedSession` reads neither argument.
-    unsafe { shared_session(class, sel) }
+unsafe extern "C" fn session_with_configuration(_class: Id, _sel: Sel, configuration: Id) -> Id {
+    new_session(configuration, std::ptr::null_mut())
 }
 
+/// FIXME (ACCURACY): the delegate is called on the task's own thread rather
+/// than on the delegate queue.
 unsafe extern "C" fn session_with_configuration_delegate_queue(
-    class: Id,
-    sel: Sel,
+    _class: Id,
+    _sel: Sel,
     configuration: Id,
     delegate: Id,
     _queue: Id,
 ) -> Id {
-    let _ = (class, sel, configuration);
+    new_session(configuration, delegate)
+}
+
+fn new_session(configuration: Id, delegate: Id) -> Id {
+    // The session keeps a copy: changing the configuration later changes
+    // nothing about a session made from it.
+    let configuration = match configuration.is_null() {
+        true => 0,
+        false => send_copy(configuration) as usize,
+    };
     objc::arc::autorelease(make(
         session_class(),
         Session {
             delegate: objc::arc::retain(delegate) as usize,
+            configuration,
         },
     ))
+}
+
+fn send_copy(object: Id) -> Id {
+    // SAFETY: `id (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(object, objc::sel::get("copy"))
+    }
+}
+
+unsafe extern "C" fn session_configuration(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a session this module made.
+    let Some(session) = (unsafe { contents::<Session>(receiver, session_class()) }) else {
+        return std::ptr::null_mut();
+    };
+    let configuration = match session.configuration {
+        0 => default_configuration(),
+        kept => kept as Id,
+    };
+    objc::arc::autorelease(send_copy(configuration))
+}
+
+unsafe extern "C" fn session_delegate(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a session this module made.
+    unsafe { contents::<Session>(receiver, session_class()) }
+        .map_or(std::ptr::null_mut(), |s| s.delegate as Id)
+}
+
+/// `request` as the session sends it: the configuration's additional headers
+/// where the request has none of that name, and its resource timeout.
+fn prepared(session: Id, mut request: Request) -> Request {
+    // SAFETY: a session this module made, or nil.
+    let Some(session) = (unsafe { contents::<Session>(session, session_class()) }) else {
+        return request;
+    };
+    // SAFETY: a configuration this module made, or zero.
+    let Some(configuration) =
+        (unsafe { contents::<Configuration>(session.configuration as Id, configuration_class()) })
+    else {
+        return request;
+    };
+    for (name, value) in header_pairs(configuration.additional_headers as Id) {
+        if !request
+            .headers
+            .iter()
+            .any(|(have, _)| have.eq_ignore_ascii_case(&name))
+        {
+            request.headers.push((name, value));
+        }
+    }
+    // FIXME (ACCURACY): both timeouts bound the whole transfer here; Apple's
+    // request timeout is the longest wait for more data.
+    request.timeout = request.timeout.min(configuration.resource_timeout);
+    request
+}
+
+/// A dictionary's entries as text, each value by its description.
+fn header_pairs(dictionary: Id) -> Vec<(String, String)> {
+    if dictionary.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `id (id, SEL)` and `id (id, SEL, id)`, a dictionary's.
+    unsafe {
+        let get: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        let lookup: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let keys = get(dictionary, objc::sel::get("allKeys"));
+        crate::elements_of(keys)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key| {
+                let value = lookup(dictionary, objc::sel::get("objectForKey:"), key as Id);
+                let value = get(value, objc::sel::get("description"));
+                (text(key as Id), text(value))
+            })
+            .collect()
+    }
 }
 
 unsafe extern "C" fn invalidate_session(_receiver: Id, _sel: Sel) {}
 
 unsafe extern "C" fn data_task_with_request(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     request: Id,
     completion: Id,
@@ -848,26 +1376,43 @@ unsafe extern "C" fn data_task_with_request(
     let Some(request) = (unsafe { request_of(request) }) else {
         return std::ptr::null_mut();
     };
-    autoreleased_task(request.clone(), completion)
+    data_task(receiver, request.clone(), completion)
 }
 
-unsafe extern "C" fn data_task_with_url(_receiver: Id, _sel: Sel, url: Id, completion: Id) -> Id {
+unsafe extern "C" fn data_task_with_request_alone(receiver: Id, sel: Sel, request: Id) -> Id {
+    // SAFETY: the same arguments, with no handler.
+    unsafe { data_task_with_request(receiver, sel, request, std::ptr::null_mut()) }
+}
+
+unsafe extern "C" fn data_task_with_url(receiver: Id, _sel: Sel, url: Id, completion: Id) -> Id {
     // SAFETY: an `NSURL`, or nil.
     let Some(text) = (unsafe { crate::url::text_of(url) }) else {
         return std::ptr::null_mut();
     };
-    autoreleased_task(Request::new(text, DEFAULT_TIMEOUT_SECONDS), completion)
+    data_task(
+        receiver,
+        Request::new(text, DEFAULT_TIMEOUT_SECONDS),
+        completion,
+    )
 }
 
-fn autoreleased_task(request: Request, completion: Id) -> Id {
+unsafe extern "C" fn data_task_with_url_alone(receiver: Id, sel: Sel, url: Id) -> Id {
+    // SAFETY: the same arguments, with no handler.
+    unsafe { data_task_with_url(receiver, sel, url, std::ptr::null_mut()) }
+}
+
+fn data_task(session: Id, request: Request, completion: Id) -> Id {
+    // SAFETY: a session this module made, or nil.
+    let delegate =
+        unsafe { contents::<Session>(session, session_class()) }.map_or(0, |s| s.delegate);
     let task = Task {
-        request,
+        request: prepared(session, request),
         // Copied here and released once the handler has run, because the block
         // a guest passes inline is stack-allocated and its scope ends the moment
         // this method returns.
         completion: objc::block::copy(completion) as usize,
-        delegate: 0,
-        session: 0,
+        delegate: objc::arc::retain(delegate as Id) as usize,
+        session: objc::arc::retain(session) as usize,
         download: false,
         description: 0,
         response: std::sync::atomic::AtomicUsize::new(0),
@@ -901,7 +1446,7 @@ fn download_task(receiver: Id, request: Id, completion: Id) -> Id {
     objc::arc::autorelease(make(
         download_task_class(),
         Task {
-            request: request.clone(),
+            request: prepared(receiver, request.clone()),
             completion: objc::block::copy(completion) as usize,
             delegate: objc::arc::retain(session.delegate as Id) as usize,
             session: objc::arc::retain(receiver) as usize,
@@ -970,6 +1515,7 @@ pub const CLASSES: &[&str] = &[
     "NSURLResponse",
     "NSHTTPURLResponse",
     "NSURLSession",
+    "NSURLSessionConfiguration",
     "NSURLSessionTask",
     "NSURLSessionDataTask",
     "NSURLSessionDownloadTask",
@@ -992,6 +1538,9 @@ pub(crate) fn install() {
         "requestWithURL:cachePolicy:timeoutInterval:" => request_with_url_policy_timeout, c"@40@0:8@16Q24d32";
     });
     methods!(immutable, {
+        "init" => init_request, c"@16@0:8";
+        "initWithURL:" => init_with_url, c"@24@0:8@16";
+        "initWithURL:cachePolicy:timeoutInterval:" => init_with_url_policy_timeout, c"@40@0:8@16Q24d32";
         "URL" => request_url, c"@16@0:8";
         "HTTPMethod" => http_method, c"@16@0:8";
         "HTTPBody" => http_body, c"@16@0:8";
@@ -1015,6 +1564,7 @@ pub(crate) fn install() {
     methods!(base, {
         "URL" => response_url, c"@16@0:8";
         "MIMEType" => mime_type, c"@16@0:8";
+        "suggestedFilename" => suggested_filename_of, c"@16@0:8";
         "textEncodingName" => text_encoding_name, c"@16@0:8";
         "expectedContentLength" => expected_content_length, c"q16@0:8";
     });
@@ -1042,11 +1592,16 @@ pub(crate) fn install() {
         "sessionWithConfiguration:delegate:delegateQueue:"
             => session_with_configuration_delegate_queue, c"@40@0:8@16@24@32";
     });
+    install_configuration();
     // `@?` for the handler, which is what tells the emulated backend's argument
     // conversion that the parameter is a block whose `invoke` needs a thunk.
     methods!(session, {
         "dataTaskWithRequest:completionHandler:" => data_task_with_request, c"@32@0:8@16@?24";
         "dataTaskWithURL:completionHandler:" => data_task_with_url, c"@32@0:8@16@?24";
+        "dataTaskWithRequest:" => data_task_with_request_alone, c"@24@0:8@16";
+        "dataTaskWithURL:" => data_task_with_url_alone, c"@24@0:8@16";
+        "configuration" => session_configuration, c"@16@0:8";
+        "delegate" => session_delegate, c"@16@0:8";
         "downloadTaskWithRequest:" => download_task_with_request, c"@24@0:8@16";
         "downloadTaskWithRequest:completionHandler:"
             => download_task_with_request_handler, c"@32@0:8@16@?24";
@@ -1065,6 +1620,33 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_suggested_filename_prefers_the_disposition_then_the_path() {
+        let header = |value: &str| vec![("Content-Disposition".to_string(), value.to_string())];
+        assert_eq!(
+            suggested_filename(
+                &header("attachment; filename=\"setup.exe\""),
+                "https://a.b/x/dl"
+            ),
+            "setup.exe"
+        );
+        assert_eq!(
+            suggested_filename(
+                &header("attachment; filename*=UTF-8''a%20b.zip"),
+                "https://a.b/"
+            ),
+            "a b.zip"
+        );
+        assert_eq!(
+            suggested_filename(&[], "https://a.b/x/file%201.tgz?q=1"),
+            "file 1.tgz"
+        );
+        assert_eq!(
+            suggested_filename(&[], "https://host.example/"),
+            "host.example"
+        );
+    }
 
     /// A request built the way a guest builds one, run the way
     /// `+sendSynchronousRequest:` runs it. Against a real server, because what

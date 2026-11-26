@@ -217,7 +217,7 @@ fn percent_encode(path: &str) -> String {
 
 /// The reverse. A `%` that is not followed by two hexadecimal digits is a
 /// literal `%`, which is what a path containing one and never encoded produces.
-fn percent_decode(text: &str, preserving: &[u8]) -> String {
+pub fn percent_decode(text: &str, preserving: &[u8]) -> String {
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
