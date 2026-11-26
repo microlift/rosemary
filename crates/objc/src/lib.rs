@@ -231,10 +231,9 @@ static EMPTY_CACHE: ObjcCache = ObjcCache {
     buckets: [0],
 };
 
-/// The classes this crate owns, as opposed to a framework's.
-///
-/// One, and it is the one the system's libobjc owns too.
-pub const ROOT_CLASSES: &[&str] = &["NSObject"];
+/// The classes this crate owns, as opposed to a framework's: the ones the
+/// system's libobjc owns too.
+pub const ROOT_CLASSES: &[&str] = &["NSObject", "Protocol"];
 
 /// The hooks each `objc_setHook_*` chain starts with, by the private name a
 /// guest that is handed one as the hook it replaced calls it through. Two may

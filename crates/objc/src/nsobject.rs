@@ -131,6 +131,16 @@ pub(crate) fn install() {
 
     crate::class::register_pair(class);
     install_proxy();
+    install_protocol(class);
+}
+
+/// `Protocol`, the class every protocol is an instance of. Its behaviour is
+/// `NSObject`'s: what a program asks of a protocol goes through the
+/// `protocol_*` functions.
+fn install_protocol(object: &'static crate::class::Class) {
+    if let Some(class) = crate::class::allocate_pair(Some(object), c"Protocol", 0) {
+        crate::class::register_pair(class);
+    }
 }
 
 /// `+resolveInstanceMethod:` and `+resolveClassMethod:` as `NSObject` has

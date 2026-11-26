@@ -18,7 +18,12 @@ pub struct Description {
 }
 
 /// A protocol.
+///
+/// An object, as on Apple's runtime: a program may message one, and a bridge
+/// does - so it begins with an `isa`, the `Protocol` class.
+#[repr(C)]
 pub struct Protocol {
+    isa: *const crate::class::Class,
     name: CString,
     /// Keyed by `(selector, required, instance)`, the three coordinates
     /// `protocol_getMethodDescription` is asked for.
@@ -205,12 +210,20 @@ pub fn allocate(name: &CStr) -> Option<&'static Protocol> {
     if lookup(name).is_some() {
         return None;
     }
+    let isa = crate::class::lookup(c"Protocol").map_or(std::ptr::null(), |class| {
+        crate::class::ptr(class).cast_const()
+    });
     let protocol = Box::leak(Box::new(Protocol {
+        isa,
         name: CString::from(name),
         contents: RwLock::new(Contents::default()),
         registered: std::sync::atomic::AtomicBool::new(false),
     }));
     crate::debug::note_handle(protocol, "protocol");
+    // Never freed, however a program retains and releases it.
+    if !isa.is_null() {
+        crate::arc::make_immortal(protocol as *const Protocol as crate::object::Id);
+    }
     Some(protocol)
 }
 
