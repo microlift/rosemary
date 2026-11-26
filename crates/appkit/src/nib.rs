@@ -131,7 +131,134 @@ unsafe extern "C" fn load_file(
     1
 }
 
+/// A new `NSNib` of the archive `bytes` hold, retained.
+pub(crate) fn new_nib(bytes: &[u8]) -> Option<Id> {
+    let class = objc::class::lookup(c"NSNib")?;
+    let nib = objc::object::create_instance(class, 0);
+    let data = corefoundation::collections::new_data(bytes.to_vec()) as Id;
+    // SAFETY: the property setter, on a fresh nib.
+    unsafe { crate::props::set_retained(nib, objc::sel::get("setNibData:"), data) };
+    objc::arc::release(data);
+    Some(nib)
+}
+
+/// The archive an `NSNib` holds.
+fn nib_bytes(nib: Id) -> Vec<u8> {
+    let data = crate::props::object(nib, "nibData");
+    if data.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the `NSData` the nib keeps.
+    unsafe {
+        let data = data as corefoundation::base::CFTypeRef;
+        let length = corefoundation::api::CFDataGetLength(data).max(0) as usize;
+        let bytes = corefoundation::api::CFDataGetBytePtr(data);
+        match bytes.is_null() {
+            true => Vec::new(),
+            false => std::slice::from_raw_parts(bytes, length).to_vec(),
+        }
+    }
+}
+
+/// `-[NSNib initWithNibData:bundle:]`.
+unsafe extern "C" fn nib_init_with_data(receiver: Id, _sel: objc::sel::Sel, data: Id, _bundle: Id) -> Id {
+    if receiver.is_null() || data.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the property setter.
+    unsafe { crate::props::set_retained(receiver, objc::sel::get("setNibData:"), data) };
+    receiver
+}
+
+/// `-[NSNib initWithNibNamed:bundle:]`: the nib of that name in the bundle,
+/// or the main bundle; nil if there is none.
+unsafe extern "C" fn nib_init_with_name(
+    receiver: Id,
+    _sel: objc::sel::Sel,
+    name: Id,
+    bundle: Id,
+) -> Id {
+    let bundle = match bundle.is_null() {
+        // SAFETY: `+[NSBundle mainBundle]` is `id (Class, SEL)`.
+        true => unsafe {
+            let class = objc::class::lookup(c"NSBundle").expect("Foundation registered NSBundle");
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(objc::class::ptr(class) as Id, objc::sel::get("mainBundle"))
+        },
+        false => bundle,
+    };
+    // SAFETY: the name is an NSString or nil.
+    let name = String::from_utf8_lossy(&unsafe { foundation::string::bytes(name) }).into_owned();
+    // SAFETY: an `NSBundle` of Foundation's.
+    let path = unsafe { foundation::bundle::resource_for_object(bundle, &name, "nib") };
+    let bytes = path.and_then(|path| {
+        let file = match path.is_dir() {
+            true => archive_in(&path),
+            false => path,
+        };
+        std::fs::read(file).ok()
+    });
+    let Some(bytes) = bytes else {
+        objc::arc::release(receiver);
+        return std::ptr::null_mut();
+    };
+    let data = corefoundation::collections::new_data(bytes) as Id;
+    // SAFETY: the property setter.
+    unsafe { crate::props::set_retained(receiver, objc::sel::get("setNibData:"), data) };
+    objc::arc::release(data);
+    receiver
+}
+
+/// The nib's objects, wired to `owner`; its top-level objects, or `None` for
+/// an archive that is not a nib.
+pub(crate) fn instantiate_nib(nib: Id, owner: Id) -> Option<Vec<Id>> {
+    match load_bytes(&nib_bytes(nib), owner) {
+        Ok(loaded) => {
+            loaded.report(Path::new("<NSNib>"));
+            Some(loaded.top_level)
+        }
+        Err(why) => {
+            eprintln!("rosemary: appkit: <NSNib>: {why}");
+            None
+        }
+    }
+}
+
+/// `-[NSNib instantiateWithOwner:topLevelObjects:]`.
+unsafe extern "C" fn nib_instantiate(
+    receiver: Id,
+    _sel: objc::sel::Sel,
+    owner: Id,
+    top_level: *mut Id,
+) -> u8 {
+    let Some(objects) = instantiate_nib(receiver, owner) else {
+        return 0;
+    };
+    if !top_level.is_null() {
+        let objects: Vec<_> = objects
+            .iter()
+            .map(|object| *object as corefoundation::base::CFTypeRef)
+            .collect();
+        let array = corefoundation::collections::new_array(
+            &objects,
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: a fresh array and the caller's writable `NSArray **`.
+        unsafe { *top_level = corefoundation::api::CFAutorelease(array) as Id };
+    }
+    1
+}
+
 pub(crate) fn install() {
+    let nib = objc::class::lookup(c"NSNib").expect("declared before its methods");
+    methods!(nib, {
+        "initWithNibData:bundle:" => nib_init_with_data, c"@32@0:8@16@24";
+        "initWithNibNamed:bundle:" => nib_init_with_name, c"@32@0:8@16@24";
+        "instantiateWithOwner:topLevelObjects:" => nib_instantiate, c"B32@0:8@16^@24";
+        "instantiateNibWithOwner:topLevelObjects:" => nib_instantiate, c"B32@0:8@16^@24";
+    });
     let bundle = objc::class::lookup(c"NSBundle").expect("Foundation registered NSBundle");
     methods!(bundle, {
         "loadNibNamed:owner:topLevelObjects:" => load_named, c"B40@0:8@16@24^@32";
@@ -147,6 +274,9 @@ pub(crate) fn install() {
 pub struct Loaded {
     /// The objects the nib built, by their place in the archive.
     pub objects: BTreeMap<Uid, Id>,
+    /// The objects whose parent is File's Owner, in the nib's order: what
+    /// `-instantiateWithOwner:topLevelObjects:` hands back.
+    pub top_level: Vec<Id>,
     /// Class names the nib held that nothing implements, deduplicated.
     pub placeholders: Vec<String>,
     /// Connections that were not made, each as a sentence naming why.
@@ -205,7 +335,12 @@ pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
         false => path.to_path_buf(),
     };
     let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let archive = Archive::parse(&bytes).map_err(|e| e.to_string())?;
+    load_bytes(&bytes, owner)
+}
+
+/// Wire the nib `bytes` hold, with `owner` standing in for File's Owner.
+pub(crate) fn load_bytes(bytes: &[u8], owner: Id) -> Result<Loaded, String> {
+    let archive = Archive::parse(bytes).map_err(|e| e.to_string())?;
 
     // `IB.objectdata` is where Interface Builder files the object data; `root`
     // is what an archive made any other way calls its top object. Both, because
@@ -229,11 +364,13 @@ pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
         building: Vec::new(),
         loaded: Loaded {
             objects: BTreeMap::new(),
+            top_level: Vec::new(),
             placeholders: Vec::new(),
             unwired: Vec::new(),
         },
     };
     builder.build_menus(root);
+    builder.build_top_level(root);
     builder.connect(root);
     builder.show_visible_windows(root);
     builder.install_constraints();
@@ -398,6 +535,26 @@ impl Builder<'_> {
         }
         objc::arc::release(binding);
         objc::arc::release(key_path);
+    }
+
+    /// Build the objects File's Owner is the parent of, which a nib holds for
+    /// its caller even when nothing in it refers to them.
+    fn build_top_level(&mut self, root: Uid) {
+        let (Some(objects), Some(parents)) = (
+            self.archive.field_object(root, "NSObjectsKeys"),
+            self.archive.field_object(root, "NSObjectsValues"),
+        ) else {
+            return;
+        };
+        let parents = self.archive.array(parents);
+        for (entry, parent) in self.archive.array(objects).into_iter().zip(parents) {
+            if Some(parent) != self.file_owner || Some(entry) == self.file_owner {
+                continue;
+            }
+            if let Some(object) = self.instantiate(entry) {
+                self.loaded.top_level.push(object);
+            }
+        }
     }
 
     /// Build the menus the nib names for the application - its menu bar
@@ -688,13 +845,17 @@ impl Builder<'_> {
     /// A new object for an entry, which [`Builder::instantiate`] remembers.
     fn create(&mut self, uid: Uid) -> Option<Id> {
         Some(match self.archive.class_name(uid) {
-            // A plain entry is a string or a number, and the archive holds its
-            // value rather than an object to build.
-            None => match self.archive.string(uid) {
-                Some(text) => foundation::string::from_str(text),
-                None => self.number(uid)?,
+            // A plain entry is a string, a number or data, and the archive
+            // holds its value rather than an object to build.
+            None => match (self.archive.string(uid), self.archive.data(uid)) {
+                (Some(text), _) => foundation::string::from_str(text),
+                (None, Some(bytes)) => corefoundation::collections::new_data(bytes.to_vec()) as Id,
+                (None, None) => self.number(uid)?,
             },
             Some("NSNumber") => self.number(uid)?,
+            Some("NSData" | "NSMutableData") => {
+                corefoundation::collections::new_data(self.archive.data(uid)?.to_vec()) as Id
+            }
             // Values an archive holds by content, such as a binding's options:
             // allocating the class would make an empty one.
             Some("NSString" | "NSMutableString" | "NSLocalizableString") => {
@@ -1309,6 +1470,7 @@ mod tests {
             building: Vec::new(),
             loaded: Loaded {
                 objects: BTreeMap::new(),
+                top_level: Vec::new(),
                 placeholders: Vec::new(),
                 unwired: Vec::new(),
             },

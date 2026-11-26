@@ -250,6 +250,20 @@ impl Archive {
         }
     }
 
+    /// The bytes of an `NSData`: an object (`NS.bytes` in a nib, `NS.data`
+    /// in a keyed archive) or data written into the table directly.
+    pub fn data(&self, uid: Uid) -> Option<&[u8]> {
+        let value = match (self.nib_objects.is_empty(), self.value(uid)) {
+            (false, _) => self.field(uid, "NS.bytes")?,
+            (true, Some(Value::Dictionary(_))) => self.field(uid, "NS.data")?,
+            (true, value) => value?,
+        };
+        match value {
+            Value::Data(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
     /// A number with a fractional part: an `NSNumber` archived as a double
     /// (`NS.dblval` in a nib), or a real written into the table directly.
     pub fn real(&self, uid: Uid) -> Option<f64> {

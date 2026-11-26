@@ -149,6 +149,11 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSStackView" => stack_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         "NSLayoutConstraint" => constraint(builder, uid),
+        "NSNib" => builder
+            .archive()
+            .field_object(uid, "NSNibFileData")
+            .and_then(|data| builder.archive().data(data).map(<[u8]>::to_vec))
+            .and_then(|bytes| crate::nib::new_nib(&bytes)),
         // Every view archives its frame, flags and subviews, whatever else its
         // class adds.
         other if is_view_class(other) => view(builder, uid, other),
@@ -247,6 +252,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSSplitView",
     "NSStackView",
     "NSLayoutConstraint",
+    "NSNib",
 ];
 
 /// A boolean field, which an archive writes as a boolean or as an integer.
