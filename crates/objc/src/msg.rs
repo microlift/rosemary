@@ -45,8 +45,10 @@ mod sends {
 
     /// log2 of the entry count.
     pub(super) const BITS: u32 = 12;
-    /// The probe's `imul` takes a sign-extended 32-bit immediate.
-    pub(super) const MULTIPLIER: i32 = -1_640_531_535;
+    /// Fibonacci hashing keeps the product's top bits, so the multiplier has
+    /// to span all 64: a 32-bit one maps keys less than ~2^21 apart, as
+    /// interned selectors and neighbouring classes are, to the same entry.
+    pub(super) const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 
     #[repr(C, align(32))]
     pub(super) struct Entry {
@@ -72,7 +74,7 @@ mod sends {
     /// its assembly.
     pub(super) fn index(class: usize, sel: usize) -> usize {
         let key = ((class as u64) << 7) ^ sel as u64;
-        (key.wrapping_mul(MULTIPLIER as i64 as u64) >> (64 - BITS)) as usize
+        (key.wrapping_mul(MULTIPLIER) >> (64 - BITS)) as usize
     }
 
     /// The `IMP` cached for `(class, sel)`, read as the probe reads it.
@@ -461,7 +463,8 @@ unsafe extern "C" fn msg_send() {
         "mov     r11, rax",
         "shl     r11, 7",
         "xor     r11, rsi",
-        "imul    r11, r11, {multiplier}",
+        "movabs  r10, {multiplier}",
+        "imul    r11, r10",
         "shr     r11, {shift}",
         "shl     r11, 5",
         "lea     r10, [rip + {table}]",
@@ -528,7 +531,7 @@ unsafe extern "C" fn msg_send() {
         "ret",
         lookup = sym lookup,
         table = sym sends::TABLE,
-        multiplier = const sends::MULTIPLIER,
+        multiplier = const sends::MULTIPLIER as i64,
         shift = const 64 - sends::BITS,
     )
 }
@@ -1210,5 +1213,22 @@ mod tests {
             to_class,
             "unrecognized selector sent to class NSObject: noSuchMessage"
         );
+    }
+
+    #[test]
+    fn nearby_classes_and_selectors_use_distinct_send_cache_entries() {
+        // Interned selector names sit a few bytes apart, as do classes
+        // allocated together; neither may crowd into a few entries.
+        const KEYS: usize = 64;
+        let class = 0x7f5c_f93a_ac80;
+        let selector = 0x05c3_d50a_9c80;
+        let by_selector: std::collections::HashSet<usize> = (0..KEYS)
+            .map(|i| sends::index(class, selector + i * 0x20))
+            .collect();
+        let by_class: std::collections::HashSet<usize> = (0..KEYS)
+            .map(|i| sends::index(class + i * 0x80, selector))
+            .collect();
+        assert_eq!(by_selector.len(), KEYS);
+        assert_eq!(by_class.len(), KEYS);
     }
 }
