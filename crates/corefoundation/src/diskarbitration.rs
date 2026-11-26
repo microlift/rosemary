@@ -35,6 +35,26 @@ pub unsafe extern "C" fn disk_create_from_volume_path(
     unsafe { crate::api::CFRetain(path) }
 }
 
+/// `DADiskRef DADiskCreateFromBSDName(CFAllocatorRef, DASessionRef, const char *name)`
+///
+/// The name itself is the handle, for the reason the volume path is above.
+///
+/// # Safety
+///
+/// `name` is null or a NUL-terminated string.
+pub unsafe extern "C" fn disk_create_from_bsd_name(
+    _allocator: CFTypeRef,
+    session: CFTypeRef,
+    name: *const std::ffi::c_char,
+) -> CFTypeRef {
+    if session.is_null() || name.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller's NUL-terminated string.
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
+    crate::string::from_bytes(name.to_bytes(), false)
+}
+
 pub unsafe extern "C" fn disk_copy_description(disk: CFTypeRef) -> CFTypeRef {
     if disk.is_null() {
         return std::ptr::null();
@@ -55,6 +75,7 @@ exports::exports! {
     functions {
         "DASessionCreate" => session_create,
         "DADiskCreateFromVolumePath" => disk_create_from_volume_path,
+        "DADiskCreateFromBSDName" => disk_create_from_bsd_name,
         "DADiskCopyDescription" => disk_copy_description,
     }
 }

@@ -617,6 +617,31 @@ pub unsafe extern "C" fn SCDynamicStoreCopyComputerName(
     crate::string::from_bytes(&buffer[..end], false)
 }
 
+/// `CFStringRef SCDynamicStoreCopyConsoleUser(SCDynamicStoreRef, uid_t *, gid_t *)`
+///
+/// The user logged in at the console, who is the one running the guest.
+///
+/// # Safety
+///
+/// `uid` and `gid` are null or writable.
+pub unsafe extern "C" fn SCDynamicStoreCopyConsoleUser(
+    _store: CFTypeRef,
+    uid: *mut u32,
+    gid: *mut u32,
+) -> CFTypeRef {
+    // FIXME (ACCURACY): the process's real ids stand in for the console
+    // session's, which differ only for a guest started under another user.
+    if !uid.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { uid.write(::darwin::credentials::getuid()) };
+    }
+    if !gid.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { gid.write(::darwin::credentials::getgid()) };
+    }
+    crate::string::from_bytes(prefix::layout::user_name().as_bytes(), false)
+}
+
 /// `CFStringRef SCDynamicStoreKeyCreateNetworkGlobalEntity(CFAllocatorRef, CFStringRef domain, CFStringRef entity)`
 ///
 /// The key is a path, and its spelling is the interface: `State:` and `IPv4`
@@ -867,6 +892,7 @@ exports::exports! {
         "SCDynamicStoreCopyProxies" => SCDynamicStoreCopyProxies,
         "SCDynamicStoreCreate" => SCDynamicStoreCreate,
         "SCDynamicStoreCopyComputerName" => SCDynamicStoreCopyComputerName,
+        "SCDynamicStoreCopyConsoleUser" => SCDynamicStoreCopyConsoleUser,
         "SCDynamicStoreKeyCreateNetworkGlobalEntity" => SCDynamicStoreKeyCreateNetworkGlobalEntity,
         "SCDynamicStoreCopyValue" => SCDynamicStoreCopyValue,
         "SCDynamicStoreKeyCreateProxies" => SCDynamicStoreKeyCreateProxies,

@@ -404,9 +404,31 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
     collections::new_data(bytes)
 }
 
+/// `CFPropertyListRef CFPropertyListCreateDeepCopy(CFAllocatorRef,
+/// CFPropertyListRef, CFOptionFlags mutabilityOption)`
+///
+/// Every container and leaf is a new object, mutable as `mutability` says, and
+/// anything that is not a property list type makes the whole copy null.
+///
+/// # Safety
+///
+/// `list` is null or an object this runtime allocated or bound.
+pub unsafe extern "C" fn CFPropertyListCreateDeepCopy(
+    _allocator: CFAllocatorRef,
+    list: CFTypeRef,
+    mutability: u64,
+) -> CFTypeRef {
+    // SAFETY: the caller's guarantee.
+    let Some(value) = (unsafe { value_of(list) }) else {
+        return std::ptr::null();
+    };
+    build(&value, mutability, 0).unwrap_or(std::ptr::null())
+}
+
 exports::exports! {
     functions {
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
+        "CFPropertyListCreateDeepCopy" => CFPropertyListCreateDeepCopy,
         "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
     }
 }

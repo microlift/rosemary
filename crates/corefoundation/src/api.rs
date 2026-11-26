@@ -2341,6 +2341,57 @@ const NAMED_ENCODINGS: &[(u32, &str, u32)] = &[
     (54936, "gb18030", 0x0632),
 ];
 
+/// The bit an `NSStringEncoding` carries when it is a `CFStringEncoding` with
+/// no Foundation number of its own.
+const NS_ENCODING_MASK: u64 = 1 << 31;
+
+/// `NSStringEncoding` 1 through 15 and the two numbered past them, as
+/// `(NSStringEncoding, CFStringEncoding)`. Foundation's UTF-8 is 4, and the
+/// CoreFoundation side of it is matched as a whole since it shares its low
+/// bits with UTF-16.
+const NS_ENCODINGS: &[(u64, u32)] = &[
+    (1, string::encoding::ASCII),
+    (2, 0x0b01), // NEXTSTEP, kCFStringEncodingNextStepLatin
+    (3, 0x0920), // Japanese EUC
+    (4, string::encoding::UTF8),
+    (5, string::encoding::ISO_LATIN_1),
+    (6, 0x0021), // kCFStringEncodingMacSymbol
+    (7, 0x0bff), // kCFStringEncodingNonLossyASCII
+    (8, 0x0420), // Shift JIS, kCFStringEncodingDOSJapanese
+    (9, 0x0202), // ISO Latin 2
+    (10, string::encoding::UTF16),
+    (11, 0x0502), // Windows Cyrillic
+    (12, string::encoding::WINDOWS_LATIN1),
+    (13, 0x0503), // Windows Greek
+    (14, 0x0504), // Windows Latin 5
+    (15, 0x0501), // Windows Latin 2
+    (21, 0x0820), // ISO-2022-JP
+    (30, string::encoding::MAC_ROMAN),
+];
+
+/// `unsigned long CFStringConvertEncodingToNSStringEncoding(CFStringEncoding)`.
+///
+/// An encoding Foundation does not number is answered with the mask bit set,
+/// which is how `NSUTF16BigEndianStringEncoding` and its kin are spelled.
+pub unsafe extern "C" fn CFStringConvertEncodingToNSStringEncoding(encoding: u32) -> u64 {
+    NS_ENCODINGS
+        .iter()
+        .find(|(_, cf)| *cf == encoding)
+        .map_or(u64::from(encoding) | NS_ENCODING_MASK, |(ns, _)| *ns)
+}
+
+/// `CFStringEncoding CFStringConvertNSStringEncodingToEncoding(unsigned long)`.
+pub unsafe extern "C" fn CFStringConvertNSStringEncodingToEncoding(encoding: u64) -> u32 {
+    if let Some((_, cf)) = NS_ENCODINGS.iter().find(|(ns, _)| *ns == encoding) {
+        return *cf;
+    }
+    if encoding & NS_ENCODING_MASK != 0 {
+        (encoding & !NS_ENCODING_MASK) as u32
+    } else {
+        INVALID_ENCODING
+    }
+}
+
 /// `CFStringEncoding CFStringConvertWindowsCodepageToEncoding(UInt32)`.
 pub unsafe extern "C" fn CFStringConvertWindowsCodepageToEncoding(codepage: u32) -> u32 {
     NAMED_ENCODINGS

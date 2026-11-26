@@ -50,6 +50,11 @@ pub fn bootstrap() {
     url::class();
     uuid::class();
     stream::class();
+    // The class a Mac gives every CoreFoundation object that has no Foundation
+    // counterpart. A bridge looks it up by name to wrap such objects.
+    // FIXME (ACCURACY): this tree's own CF type classes descend from `NSObject`
+    // directly rather than from it.
+    base::abstract_class(c"__NSCFType", None);
 }
 
 exports::exports! {
@@ -222,6 +227,8 @@ exports::exports! {
         "CFDataGetBytes" => api::CFDataGetBytes,
         "CFStringGetSystemEncoding" => api::CFStringGetSystemEncoding,
         "CFStringConvertWindowsCodepageToEncoding" => api::CFStringConvertWindowsCodepageToEncoding,
+        "CFStringConvertEncodingToNSStringEncoding" => api::CFStringConvertEncodingToNSStringEncoding,
+        "CFStringConvertNSStringEncodingToEncoding" => api::CFStringConvertNSStringEncodingToEncoding,
         "CFStringConvertIANACharSetNameToEncoding" => api::CFStringConvertIANACharSetNameToEncoding,
         "CFArrayContainsValue" => api::CFArrayContainsValue,
         "CFArrayAppendArray" => api::CFArrayAppendArray,
@@ -250,6 +257,9 @@ exports::exports! {
         stream,
     }
 }
+
+/// `kCFAllocatorUseContext`.
+const ALLOCATOR_USE_CONTEXT: u64 = 0x03ab;
 
 /// The symbols that are **data**, as `(Mach-O name, address)`.
 ///
@@ -331,6 +341,12 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     out.push((
         "_kCFAllocatorDefault".to_string(),
         base::global_cell("_kCFAllocatorDefault", 0),
+    ));
+    // A marker `CFAllocatorCreate` reads as "allocate from the new context",
+    // not an allocator; its value is Apple's.
+    out.push((
+        "_kCFAllocatorUseContext".to_string(),
+        base::global_cell("_kCFAllocatorUseContext", ALLOCATOR_USE_CONTEXT),
     ));
     for (name, kind) in [
         (

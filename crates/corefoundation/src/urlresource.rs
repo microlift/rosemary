@@ -35,6 +35,17 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_NSURLIsSymbolicLinkKey", IS_SYMBOLIC_LINK),
     ("_kCFURLFileSizeKey", FILE_SIZE),
     ("_NSURLFileSizeKey", FILE_SIZE),
+    (
+        "_kCFURLTotalFileAllocatedSizeKey",
+        TOTAL_FILE_ALLOCATED_SIZE,
+    ),
+    ("_NSURLTotalFileAllocatedSizeKey", TOTAL_FILE_ALLOCATED_SIZE),
+    ("_kCFURLFileResourceIdentifierKey", FILE_RESOURCE_IDENTIFIER),
+    ("_NSURLFileResourceIdentifierKey", FILE_RESOURCE_IDENTIFIER),
+    // Read and cleared by a program that unquarantines what it downloaded.
+    // Nothing on this host records a quarantine, so nothing answers it.
+    ("_kCFURLQuarantinePropertiesKey", QUARANTINE_PROPERTIES),
+    ("_NSURLQuarantinePropertiesKey", QUARANTINE_PROPERTIES),
     ("_kCFURLVolumeURLKey", VOLUME_URL),
     ("_NSURLVolumeURLKey", VOLUME_URL),
     ("_kCFURLVolumeTotalCapacityKey", VOLUME_TOTAL_CAPACITY),
@@ -129,6 +140,9 @@ const IS_DIRECTORY: &str = "NSURLIsDirectoryKey";
 const IS_REGULAR_FILE: &str = "NSURLIsRegularFileKey";
 const IS_SYMBOLIC_LINK: &str = "NSURLIsSymbolicLinkKey";
 const FILE_SIZE: &str = "NSURLFileSizeKey";
+const TOTAL_FILE_ALLOCATED_SIZE: &str = "NSURLTotalFileAllocatedSizeKey";
+const FILE_RESOURCE_IDENTIFIER: &str = "NSURLFileResourceIdentifierKey";
+const QUARANTINE_PROPERTIES: &str = "NSURLQuarantinePropertiesKey";
 const VOLUME_URL: &str = "NSURLVolumeURLKey";
 const VOLUME_TOTAL_CAPACITY: &str = "NSURLVolumeTotalCapacityKey";
 const VOLUME_AVAILABLE_CAPACITY: &str = "NSURLVolumeAvailableCapacityKey";
@@ -157,6 +171,9 @@ const TYPE_REGULAR: &str = "NSFileTypeRegular";
 const TYPE_SYMBOLIC_LINK: &str = "NSFileTypeSymbolicLink";
 const TYPE_SOCKET: &str = "NSFileTypeSocket";
 const TYPE_UNKNOWN: &str = "NSFileTypeUnknown";
+
+/// The unit of `st_blocks`, whatever the filesystem's own block size.
+const STAT_BLOCK_SIZE: u64 = 512;
 
 /// What a Mac calls its boot volume, and so what the guest's `/` is called.
 const ROOT_VOLUME_NAME: &str = "Macintosh HD";
@@ -349,6 +366,23 @@ pub fn property(guest: &str, key: &str) -> Option<CFTypeRef> {
         IS_REGULAR_FILE => crate::collections::boolean(metadata()?.is_file()),
         IS_SYMBOLIC_LINK => crate::collections::boolean(metadata()?.is_symlink()),
         FILE_SIZE => number(metadata()?.len()),
+        TOTAL_FILE_ALLOCATED_SIZE => {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = metadata()?;
+            if metadata.is_dir() {
+                return None;
+            }
+            number(metadata.blocks() * STAT_BLOCK_SIZE)
+        }
+        // Equal for two URLs naming one file, and only then: the device and
+        // inode, as Apple's own identifier is built from.
+        FILE_RESOURCE_IDENTIFIER => {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = metadata()?;
+            let mut bytes = metadata.dev().to_le_bytes().to_vec();
+            bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+            crate::collections::new_data(bytes)
+        }
         VOLUME_URL => crate::url::new_file_url(&volume_of(path).to_string_lossy(), true),
         VOLUME_TOTAL_CAPACITY => number(capacity(path)?.0),
         VOLUME_AVAILABLE_CAPACITY => number(capacity(path)?.1),
