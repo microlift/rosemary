@@ -227,9 +227,15 @@ fn intrinsic_content_size(view: Id) -> Option<NSSize> {
 }
 
 /// Whether the solver leaves `view` alone: its frame is set by its program,
-/// by autoresizing, or by the stack that arranges it.
+/// by autoresizing, or by the container that places it.
 fn pinned(view: Id) -> bool {
-    !view::is_constrained(view) || crate::controls::is_arranged(view)
+    !view::is_constrained(view) || placed_by_container(view)
+}
+
+/// Whether a stack or a split view places `view`, which a pass must not move
+/// back after resizing that container has placed it anew.
+fn placed_by_container(view: Id) -> bool {
+    crate::controls::is_arranged(view) || crate::split::is_pane(view)
 }
 
 /// What pulls a view towards its smallest size when its fitting size is
@@ -293,7 +299,7 @@ fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRe
         // A view its mask places moves with its superview, as the
         // constraints AppKit makes of the mask say, rather than staying put.
         let rates = match parent {
-            Some(p) if fixed && !crate::controls::is_arranged(view) => {
+            Some(p) if fixed && !placed_by_container(view) => {
                 view::autoresizing_rates(view).map(|rates| (p, rates))
             }
             _ => None,
@@ -639,7 +645,9 @@ fn pass() -> bool {
     placed.sort_by_key(|(view, _)| depth(*view));
     let mut moved = false;
     for (view, frame) in placed {
-        moved |= set_frame(view, frame);
+        if !placed_by_container(view) {
+            moved |= set_frame(view, frame);
+        }
     }
     moved |= crate::controls::arrange_stacks();
     moved |= fit_windows();

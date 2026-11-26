@@ -4,8 +4,8 @@
 //! Qt's macOS style draws its splitter handles by asking a split view to draw
 //! a divider into the style's own context.
 //!
-//! FIXME (ACCURACY): dividers cannot be dragged, holding priorities and
-//! collapsing are not modelled, and positions are not autosaved.
+//! FIXME (ACCURACY): dividers cannot be dragged, collapsing is not modelled,
+//! and positions are not autosaved.
 
 use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -18,6 +18,9 @@ use crate::define::methods;
 const THICK: isize = 1;
 const THIN: isize = 2;
 const PANE_SPLITTER: isize = 3;
+
+/// `NSLayoutPriorityDefaultLow`: a pane's holding priority until one is set.
+const DEFAULT_HOLDING_PRIORITY: f32 = 250.0;
 
 /// How wide each style's divider is, in points.
 const THICK_WIDTH: f64 = 9.0;
@@ -128,9 +131,9 @@ fn proportional(sizes: &[f64], available: f64) -> Vec<f64> {
 
 /// The visible panes, in order.
 fn panes(receiver: Id) -> Vec<Id> {
-    crate::view::subviews_of(receiver)
+    indexed_panes(receiver)
         .into_iter()
-        .filter(|pane| !crate::view::is_hidden_or_has_hidden_ancestor(*pane))
+        .map(|(_, pane)| pane)
         .collect()
 }
 
@@ -150,24 +153,132 @@ fn frame_of(view: Id) -> NSRect {
     }
 }
 
-/// `-adjustSubviews`: the panes resized in proportion so that they and the
-/// dividers between them fill the split view, as AppKit's default does.
+/// Whether `view` is a pane of a split view, which places it.
+pub(crate) fn is_pane(view: Id) -> bool {
+    let Some(split) = objc::class::lookup(c"NSSplitView") else {
+        return false;
+    };
+    // SAFETY: a view of this crate's.
+    let parent = unsafe { crate::view::superview_of(view) };
+    // SAFETY: a live view or nil.
+    crate::view::is_view(parent) && unsafe { corefoundation::base::is_kind_of(parent.cast(), split) }
+}
+
+/// The property a subview's holding priority is kept under, by its index.
+fn holding_key(index: usize) -> String {
+    format!("holdingPriorityForSubview{index}")
+}
+
+unsafe extern "C" fn holding_priority(receiver: Id, _sel: Sel, index: isize) -> f32 {
+    holding_priority_of(receiver, index as usize)
+}
+
+fn holding_priority_of(receiver: Id, index: usize) -> f32 {
+    match crate::props::integer(receiver, &holding_key(index)) {
+        0 => DEFAULT_HOLDING_PRIORITY,
+        bits => f32::from_bits(bits as u32),
+    }
+}
+
+unsafe extern "C" fn set_holding_priority(receiver: Id, _sel: Sel, priority: f32, index: isize) {
+    crate::props::set_integer_of(
+        receiver,
+        &holding_key(index as usize),
+        priority.to_bits() as usize,
+    );
+}
+
+/// The visible panes, each with its index among the subviews, which is what a
+/// holding priority is given for.
+fn indexed_panes(receiver: Id) -> Vec<(usize, Id)> {
+    crate::view::subviews_of(receiver)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, pane)| !crate::view::is_hidden_or_has_hidden_ancestor(*pane))
+        .collect()
+}
+
+/// `sizes` grown or shrunk by `delta` in all, the panes of the lowest holding
+/// priority first and shared evenly among equals; a pane given more than it
+/// has to lose passes the rest to the next priority.
+fn held(sizes: &[f64], priorities: &[f32], mut delta: f64) -> Vec<f64> {
+    let mut sizes = sizes.to_vec();
+    let mut levels: Vec<f32> = priorities.to_vec();
+    levels.sort_by(f32::total_cmp);
+    levels.dedup();
+    for level in levels {
+        let mut group: Vec<usize> = (0..sizes.len())
+            .filter(|i| priorities[*i] == level)
+            .collect();
+        while delta.abs() > 0.001 && !group.is_empty() {
+            let share = delta / group.len() as f64;
+            let mut exhausted = Vec::new();
+            for &i in &group {
+                let change = share.max(-sizes[i]);
+                sizes[i] += change;
+                delta -= change;
+                if sizes[i] <= 0.0 {
+                    exhausted.push(i);
+                }
+            }
+            if exhausted.is_empty() {
+                break;
+            }
+            group.retain(|i| !exhausted.contains(i));
+        }
+    }
+    sizes
+}
+
+/// `-adjustSubviews`: the panes resized so that they and the dividers between
+/// them fill the split view, those of the lowest holding priority taking the
+/// change.
+///
+/// FIXME (ACCURACY): panes that all hold at one priority share the change in
+/// proportion to their sizes, as AppKit did before holding priorities; which
+/// of the two AppKit does then is not observed.
 unsafe extern "C" fn adjust_subviews(receiver: Id, _sel: Sel) {
-    let panes = panes(receiver);
-    if panes.is_empty() {
+    let indexed = indexed_panes(receiver);
+    if indexed.is_empty() {
         return;
     }
-    let bounds = crate::view::bounds_of(receiver);
-    let vertical = is_vertical(receiver);
-    let along = |size: NSSize| if vertical { size.width } else { size.height };
-    let divider = thickness(receiver);
-    let available = along(bounds.size) - divider * (panes.len() - 1) as f64;
+    let along = along_axis(receiver);
+    let panes: Vec<Id> = indexed.iter().map(|(_, pane)| *pane).collect();
     let sizes: Vec<f64> = panes
         .iter()
         .map(|pane| along(frame_of(*pane).size))
         .collect();
+    let priorities: Vec<f32> = indexed
+        .iter()
+        .map(|(index, _)| holding_priority_of(receiver, *index))
+        .collect();
+    let available = available(receiver, panes.len());
+    let sizes = match priorities.windows(2).all(|pair| pair[0] == pair[1]) {
+        true => proportional(&sizes, available),
+        false => held(&sizes, &priorities, available - sizes.iter().sum::<f64>()),
+    };
+    place(receiver, &panes, &sizes);
+}
+
+/// The panes' extent along the axis the split view divides.
+fn along_axis(receiver: Id) -> impl Fn(NSSize) -> f64 {
+    let vertical = is_vertical(receiver);
+    move |size: NSSize| if vertical { size.width } else { size.height }
+}
+
+/// The room the panes have between the dividers.
+fn available(receiver: Id, panes: usize) -> f64 {
+    let along = along_axis(receiver);
+    along(crate::view::bounds_of(receiver).size) - thickness(receiver) * (panes - 1) as f64
+}
+
+/// Frame each pane at its size along the axis, across the whole split view.
+fn place(receiver: Id, panes: &[Id], sizes: &[f64]) {
+    let bounds = crate::view::bounds_of(receiver);
+    let vertical = is_vertical(receiver);
+    let divider = thickness(receiver);
     let mut position = 0.0;
-    for (pane, size) in panes.iter().zip(proportional(&sizes, available)) {
+    for (pane, size) in panes.iter().zip(sizes.iter().copied()) {
         let frame = match vertical {
             true => NSRect {
                 origin: NSPoint {
@@ -267,6 +378,8 @@ pub(crate) fn install() {
         "setVertical:" => set_vertical, c"v20@0:8c16";
         "dividerThickness" => divider_thickness, c"d16@0:8";
         "adjustSubviews" => adjust_subviews, c"v16@0:8";
+        "holdingPriorityForSubviewAtIndex:" => holding_priority, c"f24@0:8q16";
+        "setHoldingPriority:forSubviewAtIndex:" => set_holding_priority, c"v28@0:8f16q20";
         "resizeSubviewsWithOldSize:" => resize_subviews_with_old_size, c"v32@0:8{CGSize=dd}16";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "dividerStyle" => divider_style, c"q16@0:8";
@@ -300,6 +413,14 @@ mod tests {
         assert_eq!(proportional(&[100.0, 300.0], 801.0), [200.0, 601.0]);
         assert_eq!(proportional(&[0.0, 0.0], 10.0), [5.0, 5.0]);
         assert_eq!(proportional(&[50.0], 120.0), [120.0]);
+    }
+
+    #[test]
+    fn the_pane_holding_lowest_takes_the_change() {
+        assert_eq!(held(&[261.0, 910.0], &[470.0, 250.0], -22.0), [261.0, 888.0]);
+        assert_eq!(held(&[100.0, 100.0], &[250.0, 250.0], 50.0), [125.0, 125.0]);
+        // A pane that cannot shrink further passes the rest on.
+        assert_eq!(held(&[100.0, 10.0], &[470.0, 250.0], -30.0), [80.0, 0.0]);
     }
 
     #[test]

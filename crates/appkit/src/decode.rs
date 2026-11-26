@@ -604,10 +604,6 @@ fn stack_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
 /// `NSSplitView`: a view, which way it splits, and its dividers' style.
 fn split_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
     let view = view(builder, uid, "NSSplitView")?;
-    if let Some(vertical) = flag(builder, uid, "NSIsVertical") {
-        // SAFETY: `-setVertical:` takes one `BOOL`.
-        unsafe { send_flag(view, "setVertical:", vertical) };
-    }
     if let Some(style) = integer(builder, uid, "NSDividerStyle") {
         // SAFETY: `-setDividerStyle:` takes one `NSSplitViewDividerStyle`.
         unsafe { send_integer(view, "setDividerStyle:", style as usize) };
@@ -617,6 +613,36 @@ fn split_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         // SAFETY: `-setAutosaveName:` takes one string.
         unsafe { send_object(view, "setAutosaveName:", name) };
         objc::arc::release(name);
+    }
+    // Subview index to priority, each a number.
+    if let Some(priorities) = builder.archive().field_object(uid, "NSHoldingPriorities") {
+        for (index, priority) in builder.archive().dictionary(priorities) {
+            let (Some(index), Some(priority)) = (builder.object_at(index), builder.object_at(priority))
+            else {
+                continue;
+            };
+            // SAFETY: two `NSNumber`s, and `void (id, SEL, NSLayoutPriority, NSInteger)`.
+            unsafe {
+                let integer: unsafe extern "C" fn(Id, Sel) -> isize =
+                    std::mem::transmute(objc::msg::entry());
+                let float: unsafe extern "C" fn(Id, Sel) -> f32 =
+                    std::mem::transmute(objc::msg::entry());
+                let set: unsafe extern "C" fn(Id, Sel, f32, isize) =
+                    std::mem::transmute(objc::msg::entry());
+                set(
+                    view,
+                    objc::sel::get("setHoldingPriority:forSubviewAtIndex:"),
+                    float(priority, objc::sel::get("floatValue")),
+                    integer(index, objc::sel::get("integerValue")),
+                );
+            }
+        }
+    }
+    // Last: it lays the panes out, which wants the divider and the
+    // priorities the nib gave.
+    if let Some(vertical) = flag(builder, uid, "NSIsVertical") {
+        // SAFETY: `-setVertical:` takes one `BOOL`.
+        unsafe { send_flag(view, "setVertical:", vertical) };
     }
     Some(view)
 }
