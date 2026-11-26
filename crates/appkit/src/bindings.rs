@@ -174,7 +174,11 @@ enum Setter {
 /// The setter AppKit's own classes expose a binding through.
 fn setter_for(owner: Id, name: &str) -> Option<Setter> {
     Some(match name {
-        "value" if is_kind(owner, c"NSButton") || is_kind(owner, c"NSMenuItem") => {
+        "value"
+            if is_kind(owner, c"NSButton")
+                || is_kind(owner, c"NSMenuItem")
+                || is_kind(owner, c"NSSwitch") =>
+        {
             Setter::Integer("setState:")
         }
         "value" => Setter::Object("setObjectValue:"),
@@ -393,7 +397,7 @@ pub(crate) fn control_changed(control: Id) {
     let Some(binder) = binder_of(control, "value") else {
         return;
     };
-    let mut value = match is_kind(control, c"NSButton") {
+    let mut value = match is_kind(control, c"NSButton") || is_kind(control, c"NSSwitch") {
         true => {
             // SAFETY: `NSInteger (id, SEL)` and `id (Class, SEL, NSInteger)`.
             unsafe {

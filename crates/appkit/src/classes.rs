@@ -68,6 +68,7 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("NSControl", Some("NSView"), 0),
     ("NSButton", Some("NSControl"), 0),
     ("NSPopUpButton", Some("NSButton"), 0),
+    ("NSSwitch", Some("NSControl"), 0),
     ("NSTextField", Some("NSControl"), 0),
     ("NSSegmentedControl", Some("NSControl"), 0),
     ("NSMatrix", Some("NSControl"), 0),

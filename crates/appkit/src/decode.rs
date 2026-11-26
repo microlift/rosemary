@@ -143,6 +143,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSTableHeaderView" => view(builder, uid, "NSTableHeaderView"),
         "NSTreeController" | "NSArrayController" => controller(builder, uid, class_name),
         "NSCollectionView" => collection_view(builder, uid),
+        "NSSwitch" => switch(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         _ => None,
     }
@@ -179,6 +180,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSArrayController",
     "NSCollectionView",
     "NSCollectionViewGridLayout",
+    "NSSwitch",
 ];
 
 /// A boolean field, which an archive writes as a boolean or as an integer.
@@ -469,6 +471,21 @@ fn table_column(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         objc::arc::release(title);
     }
     Some(column)
+}
+
+/// `NSSwitch`: a control, and its state from the control's contents.
+fn switch(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let view = view(builder, uid, "NSSwitch")?;
+    control(builder, uid, None, view);
+    if let Some(state) = builder
+        .archive()
+        .field_object(uid, "NSControlContents")
+        .and_then(|contents| builder.archive().integer(contents))
+    {
+        // SAFETY: `-setState:` takes one `NSInteger`.
+        unsafe { send_integer(view, "setState:", state as usize) };
+    }
+    Some(view)
 }
 
 /// `NSCollectionView`: a view, its selection settings, background colours

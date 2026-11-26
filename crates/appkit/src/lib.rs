@@ -90,6 +90,7 @@ mod sheet;
 mod slider;
 mod split;
 mod status;
+mod switch;
 mod tab;
 mod table;
 pub mod text;
@@ -117,6 +118,7 @@ pub fn bootstrap() {
         table_views::install();
         tree_controller::install();
         array_controller::install();
+        switch::install();
         collection::install();
         visual_effect::install();
         alert::install();
