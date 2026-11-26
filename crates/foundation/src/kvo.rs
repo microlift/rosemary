@@ -314,20 +314,25 @@ unsafe fn wrapped(receiver: Id, sel: Sel) -> (Vec<u8>, Imp) {
 
 /// One wrapper per way an argument travels: in a general register, in a vector
 /// register as a float or a double, as two doubles, in memory, or as two words.
+///
+/// The wrapped setter's result register is handed back, since some setters
+/// answer a `BOOL` (`-[NSTreeController setSelectionIndexPaths:]`); a void
+/// setter's caller ignores it.
 macro_rules! wrapper {
     ($name:ident, $ty:ty) => {
-        unsafe extern "C" fn $name(receiver: Id, sel: Sel, value: $ty) {
+        unsafe extern "C" fn $name(receiver: Id, sel: Sel, value: $ty) -> usize {
             // SAFETY: installed only on a notifying class, for `sel`.
             let (key, imp) = unsafe { wrapped(receiver, sel) };
             let key = Text::new(&key);
             send_void(receiver, "willChangeValueForKey:", key.0);
             // SAFETY: the setter this wraps takes one `$ty`, which is how its
-            // encoding was classified.
-            unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, $ty) = std::mem::transmute(imp);
-                f(receiver, sel, value);
-            }
+            // encoding was classified, and returns nothing or one word.
+            let result = unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, $ty) -> usize = std::mem::transmute(imp);
+                f(receiver, sel, value)
+            };
             send_void(receiver, "didChangeValueForKey:", key.0);
+            result
         }
     };
 }
@@ -988,6 +993,11 @@ mod tests {
     unsafe extern "C" fn set_age(receiver: Id, _sel: Sel, value: i64) {
         unsafe { (*(receiver as *mut Person)).age = value };
     }
+    /// `years` is `age` through a setter that answers whether it took.
+    unsafe extern "C" fn set_years(receiver: Id, _sel: Sel, value: i64) -> u8 {
+        unsafe { (*(receiver as *mut Person)).age = value };
+        1
+    }
     unsafe extern "C" fn friend(receiver: Id, _sel: Sel) -> Id {
         unsafe { (*(receiver as *mut Person)).friend }
     }
@@ -1017,6 +1027,8 @@ mod tests {
             "setName:" => set_name, c"v24@0:8@16";
             "age" => age, c"q16@0:8";
             "setAge:" => set_age, c"v24@0:8q16";
+            "years" => age, c"q16@0:8";
+            "setYears:" => set_years, c"c24@0:8q16";
             "friend" => friend, c"@16@0:8";
             "setFriend:" => set_friend, c"v24@0:8@16";
             "summary" => summary, c"@16@0:8";
@@ -1076,6 +1088,22 @@ mod tests {
         // SAFETY: a live object.
         let isa = unsafe { objc::object::class_of(subject) }.expect("an object");
         assert_eq!(isa.name_str(), "NSKVONotifying_RosemaryKvoPerson");
+    }
+
+    /// A setter that answers a `BOOL` still answers it once wrapped.
+    #[test]
+    fn a_wrapped_setter_keeps_its_result() {
+        let subject = person();
+        let watcher = observer();
+        observe(subject, watcher, "years", options::NEW);
+        // SAFETY: `BOOL (id, SEL, NSInteger)`.
+        let took = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, i64) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            f(subject, objc::sel::get("setYears:"), 40)
+        };
+        assert_eq!(took, 1);
+        assert_eq!(seen(watcher), ["years 40 -"]);
     }
 
     /// Once removed, the setter still works and nothing is told.
