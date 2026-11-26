@@ -184,11 +184,7 @@ fn stop(state: &mut State) {
 /// The working directory, named for the guest and the process, so that two runs and two
 /// recordings inside one run never collide.
 fn output_path() -> String {
-    let program = crate::thunk::current()
-        .and_then(|vm| vm.program.report.images.first())
-        .map(|image| image.name.rsplit('/').next().unwrap_or(&image.name))
-        .unwrap_or("guest")
-        .to_string();
+    let program = super::program_name().unwrap_or("guest");
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

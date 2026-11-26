@@ -247,7 +247,7 @@ see which one is wrong.
 
 ## GUI
 
-On macOS, Rosemary has a built in GUI drawn over the guest's Metal or OpenGL frames, with either Objective-C runtime. It is off unless `ROSEMARY_GUI=1` is set; once on, `SHIFT` + `F7` shows or hides it. It shows the framerate of the application and has various profiling utilities built in, useful for narrowing down performance bottlenecks. `SHIFT` + `F8` gives it the mouse, and `SHIFT` + `F6`, `F9` and `F10` start an Instruments recording, region-entry counting and sampling. Under `ROSEMARY_OBJC=builtin` the hotkeys arrive only while the guest's window has the keyboard.
+On macOS, Rosemary has a built in GUI drawn over the guest's Metal or OpenGL frames, under either backend and with either Objective-C runtime. It is off unless `ROSEMARY_GUI=1` is set; once on, `SHIFT` + `F7` shows or hides it. It shows the framerate of the application and has various profiling utilities built in, useful for narrowing down performance bottlenecks. `SHIFT` + `F8` gives it the mouse, and `SHIFT` + `F6`, `F9` and `F10` start an Instruments recording, region-entry counting and sampling. Under `ROSEMARY_OBJC=builtin` the hotkeys arrive only while the guest's window has the keyboard. Region-entry counting and sampling measure recompiled code, so under `--native` they have nothing to show.
 
 ## Execution modes
 

@@ -1339,18 +1339,8 @@ impl Dock {
         let mut x = g.button.0 + g.button.2 + em * 2.0;
         x += list.text(x, 5.0, "rosemary", color::HEADING) + em;
         // The main executable is the name the person watching recognises.
-        let name = crate::thunk::current()
-            .and_then(|vm| vm.program.report.images.first())
-            .map(|image| {
-                image
-                    .name
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&image.name)
-                    .to_string()
-            })
-            .unwrap_or_else(|| "no program".into());
-        list.text(x, 5.0, &name, color::VALUE);
+        let name = super::program_name().unwrap_or("no program");
+        list.text(x, 5.0, name, color::VALUE);
 
         // Said in the loudest colour available, because while the overlay has
         // the mouse the guest is being denied it - and a game that has silently

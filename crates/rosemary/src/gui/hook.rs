@@ -36,7 +36,7 @@ fn selectors() -> &'static Selectors {
 }
 
 /// Selectors reported the first time the guest sends one, under `ROSEMARY_GUI_DEBUG`.
-const WATCHED: &[&str] = &[
+pub(super) const WATCHED: &[&str] = &[
     "presentDrawable:",
     "presentDrawable:atTime:",
     "presentDrawable:afterMinimumDuration:",

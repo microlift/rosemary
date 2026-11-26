@@ -9,6 +9,7 @@ pub mod hook;
 pub mod hotkey;
 pub mod input;
 pub mod metal;
+pub mod native;
 pub mod panel;
 pub mod sys;
 pub mod trace;
@@ -209,6 +210,12 @@ pub(crate) fn drew(backend: &str, width: f32, height: f32, vertices: usize) {
             "rosemary: gui  drew {vertices} vertices over {width:.0}x{height:.0} through {backend}"
         );
     }
+}
+
+/// The main executable's file name, under whichever backend is running it.
+pub(crate) fn program_name() -> Option<&'static str> {
+    let image = crate::exec::active()?.report().images.first()?;
+    Some(image.name.rsplit('/').next().unwrap_or(&image.name))
 }
 
 /// The font size for a surface this tall.

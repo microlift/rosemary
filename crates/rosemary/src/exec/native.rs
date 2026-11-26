@@ -256,6 +256,8 @@ impl Native {
             reason: e.to_string(),
         })?;
         crate::interpose::adopt_guest_allocator(&report);
+        #[cfg(target_os = "macos")]
+        crate::gui::native::bind(&mut report, &mut memory).map_err(load)?;
 
         let unbound = crate::program::announce_unbound_imports(&report, path);
         crate::program::announce_passthrough_imports(&report, path);
@@ -332,6 +334,8 @@ impl Execution for Native {
     }
 
     fn prepare(&self) -> Result<(), VmError> {
+        #[cfg(target_os = "macos")]
+        crate::gui::install();
         if crate::frameworks::using_builtin() {
             return self.realize_objc();
         }

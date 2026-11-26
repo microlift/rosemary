@@ -1225,6 +1225,11 @@ fn link<S: MachSpec + 'static>(
     // image the program was linked with.
     crate::interpose::apply_to_loaded(&mut report, &mut memory)
         .map_err(|e| format!("{resolved}: interpose: {e}"))?;
+    #[cfg(target_os = "macos")]
+    if spec.natively_executable() {
+        crate::gui::native::bind(&mut report, &mut memory)
+            .map_err(|e| format!("{resolved}: overlay: {e}"))?;
+    }
 
     // Say what did not resolve, here, rather than letting the guest find out by
     // calling it. The program's own link says it the same way, and this is the
