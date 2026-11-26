@@ -353,6 +353,8 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0, 1] -> true, "object_setClass", P, P, P),
     rtc!([0, 2], "object_setIvar", V, P, P, P),
     rt!("property_copyAttributeList", P, P, P),
+    // The value is a `malloc`ed copy the caller frees: nothing to translate.
+    rt!("property_copyAttributeValue", P, P, P),
     rt!("property_getAttributes", P, P),
     rt!("property_getName", P, P),
     Runtime {
@@ -759,9 +761,43 @@ fn absent(name: &str) -> Option<u64> {
         "objc_msgSend_stret" => stret,
         "objc_msgSendSuper_stret" => super_stret,
         "objc_msgSendSuper2_stret" => super2_stret,
+        "objc_exception_throw" => return Some(unthrowable as *const () as usize as u64),
         _ => return None,
     };
     Some(f as *const () as usize as u64)
+}
+
+/// `objc_exception_throw` reached natively under the builtin runtime, which
+/// cannot throw through native frames: stop, naming what was thrown, since an
+/// exception's reason is often all that says what went wrong (PyObjC puts the
+/// Python error there).
+unsafe extern "C" fn unthrowable(exception: objc::object::Id) -> ! {
+    let text = |path: &str| {
+        // SAFETY: `id (id, SEL)` along a key path; nil answers nil.
+        let value = path.split('.').fold(exception, |object, sel| unsafe {
+            let f: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel) -> objc::object::Id =
+                std::mem::transmute(objc::msg::entry());
+            f(object, objc::sel::get(sel))
+        });
+        // SAFETY: an `NSString` or nil.
+        String::from_utf8_lossy(&unsafe { foundation::string::bytes(value) }).into_owned()
+    };
+    let is_exception = objc::class::lookup(c"NSException").is_some_and(|class| {
+        // SAFETY: a live object or nil.
+        !exception.is_null() && unsafe { corefoundation::base::is_kind_of(exception.cast(), class) }
+    });
+    match is_exception {
+        true => objc::fail!(
+            "objc_exception_throw cannot unwind native frames; it threw {}: {} {}",
+            text("name"),
+            text("reason"),
+            text("userInfo.description")
+        ),
+        false => objc::fail!(
+            "objc_exception_throw cannot unwind native frames; it threw a {}",
+            text("className")
+        ),
+    }
 }
 
 /// The debug overlay's seam into dispatch, and nothing where there is no overlay.

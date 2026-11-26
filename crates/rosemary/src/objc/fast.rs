@@ -93,6 +93,7 @@ static NEVER_DISPATCHES: &[&str] = &[
     "object_getIndexedIvars",
     "object_getIvar",
     "property_copyAttributeList",
+    "property_copyAttributeValue",
     "sel_getName",
     "sel_getUid",
     "sel_isEqual",
