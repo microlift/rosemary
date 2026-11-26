@@ -1395,7 +1395,17 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
         return;
     }
     if view.frame.size != before.size {
-        resize_subviews(receiver, before.size);
+        // Sent, as AppKit sends it: a split view lays its panes out here, and
+        // a guest's override is how it lays out its own.
+        // SAFETY: `void (id, SEL, NSSize)`, which every view answers.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSSize) = std::mem::transmute(objc::msg::entry());
+            f(
+                receiver,
+                objc::sel::get("resizeSubviewsWithOldSize:"),
+                before.size,
+            );
+        }
     }
     // AppKit keeps a view's layer where the view is.
     let layer = view_of(receiver).layer;

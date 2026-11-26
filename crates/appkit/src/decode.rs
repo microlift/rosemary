@@ -144,6 +144,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSTreeController" | "NSArrayController" => controller(builder, uid, class_name),
         "NSCollectionView" => collection_view(builder, uid),
         "NSSwitch" => switch(builder, uid),
+        "NSSplitView" => split_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
         _ => None,
     }
@@ -181,6 +182,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSCollectionView",
     "NSCollectionViewGridLayout",
     "NSSwitch",
+    "NSSplitView",
 ];
 
 /// A boolean field, which an archive writes as a boolean or as an integer.
@@ -471,6 +473,26 @@ fn table_column(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         objc::arc::release(title);
     }
     Some(column)
+}
+
+/// `NSSplitView`: a view, which way it splits, and its dividers' style.
+fn split_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let view = view(builder, uid, "NSSplitView")?;
+    if let Some(vertical) = flag(builder, uid, "NSIsVertical") {
+        // SAFETY: `-setVertical:` takes one `BOOL`.
+        unsafe { send_flag(view, "setVertical:", vertical) };
+    }
+    if let Some(style) = integer(builder, uid, "NSDividerStyle") {
+        // SAFETY: `-setDividerStyle:` takes one `NSSplitViewDividerStyle`.
+        unsafe { send_integer(view, "setDividerStyle:", style as usize) };
+    }
+    if let Some(name) = text(builder, uid, "NSAutosaveName").filter(|n| !n.is_empty()) {
+        let name = foundation::string::from_str(name);
+        // SAFETY: `-setAutosaveName:` takes one string.
+        unsafe { send_object(view, "setAutosaveName:", name) };
+        objc::arc::release(name);
+    }
+    Some(view)
 }
 
 /// `NSSwitch`: a control, and its state from the control's contents.
