@@ -178,6 +178,9 @@ fn setter_for(owner: Id, name: &str) -> Option<Setter> {
             Setter::Integer("setState:")
         }
         "value" => Setter::Object("setObjectValue:"),
+        "contentArray" | "contentObject" if is_kind(owner, c"NSObjectController") => {
+            Setter::Object("setContent:")
+        }
         "enabled" => Setter::Bool("setEnabled:"),
         "hidden" => Setter::Bool("setHidden:"),
         "editable" => Setter::Bool("setEditable:"),

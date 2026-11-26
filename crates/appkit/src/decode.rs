@@ -141,6 +141,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSTabView" => tab_view(builder, uid),
         "NSTabViewItem" => tab_view_item(builder, uid),
         "NSTableHeaderView" => view(builder, uid, "NSTableHeaderView"),
+        "NSTreeController" => tree_controller(builder, uid),
         _ => None,
     }
 }
@@ -172,6 +173,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSTabView",
     "NSTabViewItem",
     "NSTableHeaderView",
+    "NSTreeController",
 ];
 
 /// A boolean field, which an archive writes as a boolean or as an integer.
@@ -460,6 +462,57 @@ fn table_column(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
         objc::arc::release(title);
     }
     Some(column)
+}
+
+/// `NSTreeController`: `-init`, then what Interface Builder set. A flag the
+/// archive leaves out is the controller's default.
+fn tree_controller(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let controller = allocate("NSTreeController")?;
+    // SAFETY: `-init` is `id (id, SEL)`.
+    let controller = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(controller, objc::sel::get("init"))
+    };
+    if let Some(name) = text(builder, uid, "NSObjectClassName").map(str::to_string) {
+        match std::ffi::CString::new(name.as_str())
+            .ok()
+            .and_then(|n| objc::class::lookup(&n))
+        {
+            // SAFETY: `-setObjectClass:` takes one class.
+            Some(class) => unsafe {
+                send_object(controller, "setObjectClass:", objc::class::ptr(class) as Id)
+            },
+            None => builder.note_missing(&name),
+        }
+    }
+    for (key, selector) in [
+        ("NSTreeContentChildrenKey", "setChildrenKeyPath:"),
+        ("NSTreeContentCountKey", "setCountKeyPath:"),
+        ("NSTreeContentLeafKey", "setLeafKeyPath:"),
+    ] {
+        if let Some(path) = text(builder, uid, key) {
+            let path = foundation::string::from_str(path);
+            // SAFETY: each setter takes one string.
+            unsafe { send_object(controller, selector, path) };
+            objc::arc::release(path);
+        }
+    }
+    for (key, selector) in [
+        ("NSEditable", "setEditable:"),
+        ("NSAvoidsEmptySelection", "setAvoidsEmptySelection:"),
+        ("NSPreservesSelection", "setPreservesSelection:"),
+        ("NSSelectsInsertedObjects", "setSelectsInsertedObjects:"),
+        (
+            "NSAutomaticallyPreparesContent",
+            "setAutomaticallyPreparesContent:",
+        ),
+    ] {
+        if let Some(value) = flag(builder, uid, key) {
+            // SAFETY: each setter takes one `BOOL`.
+            unsafe { send_flag(controller, selector, value) };
+        }
+    }
+    Some(controller)
 }
 
 /// An image view, and the image, scaling and alignment its cell holds.

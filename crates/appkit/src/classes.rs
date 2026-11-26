@@ -19,6 +19,21 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("NSViewController", Some("NSResponder"), 0),
     ("NSController", None, 0),
     (
+        "NSObjectController",
+        Some("NSController"),
+        crate::tree_controller::OBJECT_CONTROLLER_INSTANCE_SIZE,
+    ),
+    (
+        "NSTreeController",
+        Some("NSObjectController"),
+        crate::tree_controller::TREE_CONTROLLER_INSTANCE_SIZE,
+    ),
+    (
+        "NSTreeNode",
+        None,
+        crate::tree_controller::TREE_NODE_INSTANCE_SIZE,
+    ),
+    (
         "NSUserDefaultsController",
         Some("NSController"),
         crate::bindings::DEFAULTS_CONTROLLER_INSTANCE_SIZE,

@@ -94,6 +94,7 @@ pub mod text;
 pub mod textinput;
 mod transaction;
 mod transform;
+mod tree_controller;
 pub mod uchr;
 pub mod view;
 mod view_animation;
@@ -112,6 +113,7 @@ pub fn bootstrap() {
         view_controller::install();
         bindings::install();
         table_views::install();
+        tree_controller::install();
         visual_effect::install();
         alert::install();
         panel::install();
