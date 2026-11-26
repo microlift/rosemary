@@ -290,12 +290,22 @@ unsafe extern "C" fn set_value_for_key(receiver: Id, _sel: Sel, value: Id, key: 
         return;
     }
 
-    // Then the ivar, which is what Apple falls back to.
+    // Then the ivar, which is what Apple falls back to, and then the class's
+    // own answer for a key it does not have.
     let Some(ivar) = ivar_for(class, key) else {
-        objc::fail!(
-            "-[{} setValue:forKey:@\"{key}\"]: no setter and no ivar of that name",
-            class.name_str()
-        );
+        let key = crate::string::from_str(key);
+        // SAFETY: `void (id, SEL, id, NSString *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+            f(
+                receiver,
+                objc::sel::get("setValue:forUndefinedKey:"),
+                value,
+                key,
+            );
+        }
+        objc::arc::release(key);
+        return;
     };
     let Some(shape) = Shape::of(ivar.types().to_bytes()) else {
         objc::fail!(
@@ -454,10 +464,14 @@ unsafe extern "C" fn value_for_key(receiver: Id, _sel: Sel, key: Id) -> Id {
     }
 
     let Some(ivar) = ivar_for(class, key) else {
-        objc::fail!(
-            "-[{} valueForKey:@\"{key}\"]: no getter and no ivar of that name",
-            class.name_str()
-        );
+        // Autoreleased: the answer may be the key itself.
+        let key = objc::arc::autorelease(crate::string::from_str(key));
+        // SAFETY: `id (id, SEL, NSString *)`.
+        return unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get("valueForUndefinedKey:"), key)
+        };
     };
     let Some(shape) = Shape::of(ivar.types().to_bytes()) else {
         objc::fail!(
@@ -473,6 +487,32 @@ unsafe extern "C" fn value_for_key(receiver: Id, _sel: Sel, key: Id) -> Id {
             std::slice::from_raw_parts((receiver as *const u8).offset(ivar.offset()), ivar.size()),
         )
     }
+}
+
+/// `-valueForUndefinedKey:`, which a class overrides to answer keys it has
+/// no accessor or ivar for, as PyObjC's classes do with Python attributes.
+///
+/// FIXME (ACCURACY): Apple raises `NSUndefinedKeyException`; this runtime
+/// cannot raise from here, so it stops.
+unsafe extern "C" fn value_for_undefined_key(receiver: Id, _sel: Sel, key: Id) -> Id {
+    // SAFETY: a live object, and the key is an `NSString`.
+    let (class, key) = unsafe { (objc::object::class_of(receiver), crate::string::bytes(key)) };
+    objc::fail!(
+        "-[{} valueForKey:@\"{}\"]: no getter and no ivar of that name",
+        class.map_or("nil", |c| c.name_str()),
+        String::from_utf8_lossy(&key)
+    );
+}
+
+/// `-setValue:forUndefinedKey:`; see [`value_for_undefined_key`].
+unsafe extern "C" fn set_value_for_undefined_key(receiver: Id, _sel: Sel, _value: Id, key: Id) {
+    // SAFETY: a live object, and the key is an `NSString`.
+    let (class, key) = unsafe { (objc::object::class_of(receiver), crate::string::bytes(key)) };
+    objc::fail!(
+        "-[{} setValue:forKey:@\"{}\"]: no setter and no ivar of that name",
+        class.map_or("nil", |c| c.name_str()),
+        String::from_utf8_lossy(&key)
+    );
 }
 
 /// `-setNilValueForKey:`, which Apple makes an exception: nil is no scalar.
@@ -526,6 +566,8 @@ pub(crate) fn install() {
         "setValue:forKey:" => set_value_for_key, c"v32@0:8@16@24";
         "setNilValueForKey:" => set_nil_value_for_key, c"v24@0:8@16";
         "valueForKey:" => value_for_key, c"@24@0:8@16";
+        "valueForUndefinedKey:" => value_for_undefined_key, c"@24@0:8@16";
+        "setValue:forUndefinedKey:" => set_value_for_undefined_key, c"v32@0:8@16@24";
         "setValue:forKeyPath:" => set_value_for_key_path, c"v32@0:8@16@24";
         "valueForKeyPath:" => value_for_key_path, c"@24@0:8@16"
     });
@@ -534,6 +576,30 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn answer_undefined(_receiver: Id, _sel: Sel, key: Id) -> Id {
+        key
+    }
+
+    /// A key with no accessor or ivar is the class's own to answer.
+    #[test]
+    fn an_unknown_key_asks_value_for_undefined_key() {
+        crate::bootstrap();
+        let class = corefoundation::base::register(c"RosemaryKvcUndefined", None, 8, false);
+        class.replace_method(
+            objc::sel::get("valueForUndefinedKey:"),
+            answer_undefined as *const std::ffi::c_void,
+            c"@24@0:8@16",
+        );
+        let object = objc::object::create_instance(class, 0);
+        let key = crate::string::from_str("profile");
+        // SAFETY: a live object and an `NSString`.
+        let value = unsafe { value_for_key(object, objc::sel::get("valueForKey:"), key) };
+        // SAFETY: the string `answer_undefined` handed back.
+        assert_eq!(unsafe { crate::string::bytes(value) }, b"profile");
+        objc::arc::release(key);
+        objc::arc::release(object);
+    }
 
     #[test]
     fn a_method_encoding_splits_into_its_types() {
