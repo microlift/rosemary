@@ -76,6 +76,13 @@ pub(crate) fn insensitive_at(dirfd: libc::c_int, path: &CStr) -> Option<CString>
 /// a directory this cannot speak for, and picking either would be a coin toss
 /// the caller has no way to notice.
 fn sole_match(directory: &Path, name: &str) -> Option<PathBuf> {
+    // The exact name already failed, and on such a volume no other spelling
+    // can succeed. Listing the directory anyway costs a scan, and on macOS a
+    // privacy prompt for a protected folder such as `~/Documents`.
+    let host = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes()).ok()?;
+    if starnix::fs::folds_case(&host) {
+        return None;
+    }
     let mut found = None;
     for entry in std::fs::read_dir(directory).ok()? {
         // An incomplete enumeration cannot prove that a match is unique. In
