@@ -3745,6 +3745,9 @@ pub(crate) fn install() {
         "setTranslatesAutoresizingMaskIntoConstraints:" => set_translates_autoresizing_mask,
             c"v20@0:8c16";
         "translatesAutoresizingMaskIntoConstraints" => translates_autoresizing_mask, c"c16@0:8";
+        // `NSUserInterfaceItemIdentification`.
+        "identifier" => crate::props::get_object, c"@16@0:8";
+        "setIdentifier:" => crate::props::set_copied, c"v24@0:8@16";
         "enclosingScrollView" => enclosing_scroll_view, c"@16@0:8";
         "isDescendantOf:" => is_descendant_of, c"c24@0:8@16";
         "viewWillMoveToWindow:" => hook_with_object, c"v24@0:8@16";

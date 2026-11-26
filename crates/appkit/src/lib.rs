@@ -75,6 +75,8 @@ pub mod nib;
 pub mod nsevent;
 pub mod opengl;
 pub mod panel;
+#[cfg(test)]
+mod fixture;
 mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;

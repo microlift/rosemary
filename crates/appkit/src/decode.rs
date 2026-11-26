@@ -118,7 +118,7 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
     match class_name {
         "NSWindowTemplate" => window_template(builder, uid),
         "NSCustomView" => custom_view(builder, uid),
-        "NSClassSwapper" => custom_view(builder, uid),
+        "NSClassSwapper" => swapped(builder, uid),
         "NSView" => view(builder, uid, "NSView"),
         "NSMenu" => menu(builder, uid),
         "NSMenuItem" => menu_item(builder, uid),
@@ -133,7 +133,8 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSSegmentedControl" => segmented_control(builder, uid),
         "NSClipView" => clip_view(builder, uid),
         "NSTextView" => text_view(builder, uid),
-        "NSTableView" => table_view(builder, uid),
+        "NSTableView" => table_view(builder, uid, "NSTableView"),
+        "NSOutlineView" => table_view(builder, uid, "NSOutlineView"),
         "NSTableColumn" => table_column(builder, uid),
         "NSScroller" => scroller(builder, uid),
         "NSTextField" => text_field(builder, uid),
@@ -146,7 +147,65 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSSwitch" => switch(builder, uid),
         "NSSplitView" => split_view(builder, uid),
         "NSCollectionViewGridLayout" => grid_layout(builder, uid),
+        // Every view archives its frame, flags and subviews, whatever else its
+        // class adds.
+        other if is_view_class(other) => view(builder, uid, other),
         _ => None,
+    }
+}
+
+/// Whether [`build`] decodes entries of the class `name`: those it names, and
+/// every implemented subclass of `NSView`.
+pub(crate) fn decodes(name: &str) -> bool {
+    DECODED.contains(&name) || is_view_class(name)
+}
+
+fn is_view_class(name: &str) -> bool {
+    let Some(view) = objc::class::lookup(c"NSView") else {
+        return false;
+    };
+    !crate::classes::is_placeholder(name)
+        && std::ffi::CString::new(name)
+            .ok()
+            .and_then(|n| objc::class::look_up(&n))
+            .is_some_and(|class| class.chain().any(|c| std::ptr::eq(c, view)))
+}
+
+/// The class to make for an entry: the custom class a swapper or custom view
+/// names, or else `default`.
+fn made_as(builder: &dyn Builder, uid: Uid, default: &str) -> String {
+    match builder.archive().class_name(uid) {
+        Some("NSClassSwapper" | "NSCustomView") => text(builder, uid, "NSClassName"),
+        _ => None,
+    }
+    .unwrap_or(default)
+    .to_string()
+}
+
+/// `NSClassSwapper`: the archived class's keys, decoded as that class is, into
+/// an instance of the custom class it names.
+fn swapped(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let original = text(builder, uid, "NSOriginalClassName")
+        .unwrap_or("NSView")
+        .to_string();
+    if !matches!(original.as_str(), "NSClassSwapper" | "NSCustomView") && decodes(&original) {
+        return build(builder, uid, &original);
+    }
+    let wanted = made_as(builder, uid, &original);
+    if is_view_class(&wanted) {
+        return view(builder, uid, &wanted);
+    }
+    // FIXME (ACCURACY): an object of a class this module does not decode, such
+    // as a custom formatter, is made with `-init` rather than `-initWithCoder:`.
+    let object = allocate(&wanted).or_else(|| {
+        builder.note_missing(&wanted);
+        None
+    })?;
+    // SAFETY: `-init` is `id (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        let object = f(object, objc::sel::get("init"));
+        (!object.is_null()).then_some(object)
     }
 }
 
@@ -170,6 +229,7 @@ pub(crate) const DECODED: &[&str] = &[
     "NSClipView",
     "NSTextView",
     "NSTableView",
+    "NSOutlineView",
     "NSTableColumn",
     "NSScroller",
     "NSTextField",
@@ -387,22 +447,13 @@ fn window_template(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
 }
 
 fn custom_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
-    let wanted = text(builder, uid, "NSClassName")
-        .unwrap_or("NSView")
-        .to_string();
-    let view = view(builder, uid, &wanted)?;
-    // A swapper keeps the archived class's own keys; a table's are its rows.
-    match text(builder, uid, "NSOriginalClassName") {
-        Some("NSTableView") => table_details(builder, uid, view),
-        Some("NSCollectionView") => collection_details(builder, uid, view),
-        _ => {}
-    }
-    Some(view)
+    view(builder, uid, "NSView")
 }
 
-/// `NSTableView`: a view, and its rows' height, background and columns.
-fn table_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
-    let view = view(builder, uid, "NSTableView")?;
+/// `NSTableView` and `NSOutlineView`: a view, and its rows' height,
+/// background and columns.
+fn table_view(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
+    let view = view(builder, uid, class_name)?;
     table_details(builder, uid, view);
     Some(view)
 }
@@ -1315,10 +1366,11 @@ mod vflags {
 }
 
 fn view(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
-    let object = match allocate(class_name) {
+    let class_name = made_as(builder, uid, class_name);
+    let object = match allocate(&class_name) {
         Some(object) => object,
         None => {
-            builder.note_missing(class_name);
+            builder.note_missing(&class_name);
             return None;
         }
     };
@@ -1386,6 +1438,13 @@ fn view(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
             // SAFETY: `-setHidden:` takes one `BOOL`.
             unsafe { send_flag(view, "setHidden:", true) };
         }
+    }
+
+    if let Some(identifier) = text(builder, uid, "NSReuseIdentifierKey") {
+        let identifier = foundation::string::from_str(identifier);
+        // SAFETY: `-setIdentifier:` takes one string.
+        unsafe { send_object(view, "setIdentifier:", identifier) };
+        objc::arc::release(identifier);
     }
 
     if let Some(subviews) = builder.archive().field_object(uid, "NSSubviews") {
@@ -1502,6 +1561,40 @@ mod tests {
                 std::mem::transmute(method.implementation());
             f(view, sel)
         }
+    }
+
+    /// A class swapper keeps the keys of the class it stands in for, so a
+    /// custom button subclass is decoded as a button rather than a bare view.
+    #[test]
+    fn a_swapped_class_is_decoded_as_the_class_it_replaces() {
+        use crate::fixture::{Field, archive};
+        crate::bootstrap();
+        let button = objc::class::lookup(c"NSButton").expect("NSButton");
+        if objc::class::lookup(c"RosemaryTestSwappedButton").is_none() {
+            corefoundation::base::register(
+                c"RosemaryTestSwappedButton",
+                Some(button),
+                button.instance_size(),
+                false,
+            );
+        }
+        let view = decode(&archive(
+            "root",
+            &[(
+                "NSClassSwapper",
+                vec![
+                    ("NSClassName", Field::Text("RosemaryTestSwappedButton")),
+                    ("NSOriginalClassName", Field::Text("NSButton")),
+                    ("NSFrame", Field::Text("{{1, 2}, {30, 40}}")),
+                    ("NSTag", Field::Int(7)),
+                ],
+            )],
+        ));
+        // SAFETY: a live object.
+        let class = unsafe { objc::object::class_of(view) }.expect("a class");
+        assert_eq!(class.name_str(), "RosemaryTestSwappedButton");
+        assert_eq!(send::<isize>(view, "tag"), 7);
+        assert_eq!(frame_of(view).size.height, 40.0);
     }
 
     /// A view resizes with its superview because the *nib* said so. Nothing

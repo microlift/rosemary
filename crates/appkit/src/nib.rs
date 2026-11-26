@@ -730,7 +730,9 @@ impl Builder<'_> {
         // An archived AppKit object is not built by allocating a class of its
         // name: `NSWindowTemplate` is a *description* of an `NSWindow`, and the
         // name is the description's. `crate::decode` is where that is undone.
-        if crate::decode::DECODED.contains(&name) {
+        if crate::decode::DECODED.contains(&name)
+            || (self.decoding.is_some() && crate::decode::decodes(name))
+        {
             return self
                 .decoding
                 .take()
