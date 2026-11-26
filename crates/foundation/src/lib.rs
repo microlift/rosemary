@@ -62,6 +62,7 @@ pub mod urlsession;
 pub mod value;
 
 mod collections;
+pub use collections::elements_of;
 
 use std::sync::Once;
 
@@ -73,8 +74,8 @@ pub fn bootstrap() {
         string::install();
         characterset::install();
         indexset::install();
-        attributed_string::install();
         indexpath::install();
+        attributed_string::install();
         collections::install();
         enumeration::install();
         transformer::install();

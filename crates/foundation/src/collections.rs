@@ -65,7 +65,7 @@ unsafe extern "C" fn array_by_adding_object(receiver: Id, _sel: Sel, object: Id)
 /// # Safety
 ///
 /// `array` is null or a live object.
-pub(crate) unsafe fn elements_of(array: Id) -> Option<Vec<CFTypeRef>> {
+pub unsafe fn elements_of(array: Id) -> Option<Vec<CFTypeRef>> {
     // SAFETY: the caller's guarantee.
     if let Some(own) = unsafe { collections::array(array as CFTypeRef) } {
         return Some(own.values.clone());
