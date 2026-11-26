@@ -782,6 +782,16 @@ pub unsafe extern "C" fn mach_vm_remap(
     let placement = flags & (VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR | VM_FLAGS_OVERWRITE);
     let placed = match (copy, source_target) {
         (true, _) => remap_copy(source_task, start, length, at, mask, placement, inheritance),
+        // Memory neither side can write cannot tell a share from a copy, and
+        // a copy needs nothing from the host: libffi remaps its own trampoline
+        // code this way.
+        // FIXME (ACCURACY): a source later made writable and written is not
+        // seen through the copy, as it would be through a share.
+        (false, Target::Local)
+            if protection & VM_PROT_WRITE == 0 && entry::shared_range(start, length).is_none() =>
+        {
+            remap_copy(source_task, start, length, at, mask, placement, inheritance)
+        }
         (false, Target::Local) => remap_shared(start, length, at, mask, placement),
         (false, Target::Remote { .. }) => {
             static SAID: std::sync::Once = std::sync::Once::new();
