@@ -1493,6 +1493,8 @@ unsafe extern "C" fn init_with_content_rect(
     _backing: usize,
     _defer: u8,
 ) -> Id {
+    // Whether the desktop shows the menus decides how tall the chrome is.
+    crate::globalmenu::prepare();
     let window = window_of(receiver);
     window.style_mask = style_mask;
     // The content rectangle grows upwards by the chrome, as a Mac's frame

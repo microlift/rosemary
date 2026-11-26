@@ -21,6 +21,8 @@ iosurface.workspace = true
 static_init.workspace = true
 owned_ttf_parser.workspace = true
 tiny-skia.workspace = true
+serde.workspace = true
+zbus.workspace = true
 
 [dev-dependencies]
 sdl3 = { workspace = true, features = ["test-support"] }

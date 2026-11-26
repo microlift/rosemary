@@ -44,6 +44,7 @@ mod displaylink;
 pub mod dock;
 pub mod event;
 mod font;
+mod globalmenu;
 pub mod hitheme;
 pub mod launch;
 pub mod launchservices;
@@ -127,6 +128,7 @@ pub fn bootstrap() {
         image::install();
         image::bitmap::install();
         menu::install();
+        globalmenu::install();
         screen::install();
         displaylink::install();
         window::install();

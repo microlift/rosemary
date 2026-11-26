@@ -946,11 +946,15 @@ pub(crate) fn mark_separator(item: Id) {
     item_of(item).separator = 1;
 }
 
+/// The item's key equivalent and its `NSEventModifierFlags`.
+pub(crate) fn key_equivalent_of(item: Id) -> (String, u64) {
+    let item = item_of(item);
+    (string_of(item.key_equivalent), item.modifier_mask as u64)
+}
+
 /// The item's key equivalent as a Mac menu shows it.
 pub(crate) fn shortcut_label(item: Id) -> String {
-    let item = item_of(item);
-    let key = string_of(item.key_equivalent);
-    let mask = item.modifier_mask as u64;
+    let (key, mask) = key_equivalent_of(item);
     use crate::keymap::flags;
     chrome::menu::shortcut_label(
         &key,

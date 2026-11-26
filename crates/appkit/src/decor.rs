@@ -21,7 +21,7 @@ use static_init::dynamic;
 /// `ROSEMARY_DECORATIONS`: `client` (the default) draws the titlebar here;
 /// `server` leaves it to the host's window manager.
 pub const DECORATIONS_ENV: &str = "ROSEMARY_DECORATIONS";
-/// `ROSEMARY_MENU`: `titlebar`, `strip` or `none`.
+/// `ROSEMARY_MENU`: `global` (the default), `titlebar`, `strip` or `none`.
 pub const MENU_ENV: &str = "ROSEMARY_MENU";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +42,11 @@ pub enum MenuPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     pub decorations: Decorations,
+    /// Where the windows' own chrome shows the menus.
     pub menu: MenuPlacement,
+    /// Whether the desktop's global menu bar shows them instead, while it
+    /// has one.
+    pub global: bool,
 }
 
 impl Config {
@@ -66,18 +70,31 @@ impl Config {
             // There is no titlebar of this runtime's to put them in.
             Decorations::Server => MenuPlacement::Strip,
         };
-        let menu = match menu.map(|v| v.trim().to_ascii_lowercase()) {
-            None => default_menu,
-            Some(v) if v.is_empty() => default_menu,
-            Some(v) if v == "titlebar" => default_menu,
-            Some(v) if v == "strip" => MenuPlacement::Strip,
-            Some(v) if v == "none" => MenuPlacement::Hidden,
+        let (menu, global) = match menu.map(|v| v.trim().to_ascii_lowercase()) {
+            None => (default_menu, true),
+            Some(v) if v.is_empty() || v == "global" => (default_menu, true),
+            Some(v) if v == "titlebar" => (default_menu, false),
+            Some(v) if v == "strip" => (MenuPlacement::Strip, false),
+            Some(v) if v == "none" => (MenuPlacement::Hidden, false),
             Some(v) => {
                 warn(MENU_ENV, &v);
-                default_menu
+                (default_menu, true)
             }
         };
-        Config { decorations, menu }
+        Config {
+            decorations,
+            menu,
+            global,
+        }
+    }
+
+    /// Where the windows show the menus now: nowhere while the desktop's
+    /// global menu bar has them.
+    pub fn shown_menu(self) -> MenuPlacement {
+        match self.global && crate::globalmenu::in_use() {
+            true => MenuPlacement::Hidden,
+            false => self.menu,
+        }
     }
 }
 
@@ -162,7 +179,7 @@ pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: b
         Decorations::Client => theme.titlebar_height,
         Decorations::Server => 0.0,
     };
-    let strip = match config.menu == MenuPlacement::Strip && !panel {
+    let strip = match config.shown_menu() == MenuPlacement::Strip && !panel {
         true => theme.strip_height,
         false => 0.0,
     };
@@ -292,6 +309,7 @@ pub fn presented_opaque(sdl: sdl3::Window) {
 /// presenter goes with it, and its address may be reused.
 pub(crate) fn destroyed(sdl: sdl3::Window) {
     forget_sdl(sdl);
+    crate::globalmenu::destroyed(sdl);
     OPAQUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -501,7 +519,7 @@ fn menu_titles() -> Vec<(Id, MenuTitle)> {
 
 fn models(config: Config, facts: &Facts, window: Id) -> (Option<Bar>, Option<Bar>) {
     let (titlebar_height, strip_height) = rows(config, facts);
-    let menus: Vec<MenuTitle> = match config.menu == MenuPlacement::Hidden || facts.panel {
+    let menus: Vec<MenuTitle> = match config.shown_menu() == MenuPlacement::Hidden || facts.panel {
         true => Vec::new(),
         false => menu_titles().into_iter().map(|(_, title)| title).collect(),
     };
@@ -1801,6 +1819,17 @@ mod tests {
         let config = Config::parse(None, None);
         assert_eq!(config.decorations, Decorations::Client);
         assert_eq!(config.menu, MenuPlacement::Titlebar);
+    }
+
+    #[test]
+    fn the_global_menu_is_the_default_with_the_window_menus_as_fallback() {
+        assert!(Config::parse(None, None).global);
+        let config = Config::parse(Some("server"), Some("global"));
+        assert!(config.global);
+        assert_eq!(config.menu, MenuPlacement::Strip);
+        for menu in ["titlebar", "strip", "none"] {
+            assert!(!Config::parse(None, Some(menu)).global, "{menu}");
+        }
     }
 
     #[test]
