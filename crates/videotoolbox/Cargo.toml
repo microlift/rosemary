@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Offer GStreamer's software H.264 decoder to sessions; links GStreamer.
+gstreamer = ["mediabackend/gstreamer"]
+
 [dependencies]
 exports.workspace = true
 corefoundation.workspace = true
 coremedia.workspace = true
+corevideo.workspace = true
+mediabackend.workspace = true
+objc.workspace = true
 
 [lints]
 workspace = true

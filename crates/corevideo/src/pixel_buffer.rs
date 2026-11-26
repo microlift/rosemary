@@ -251,9 +251,11 @@ macro_rules! forward_foreign {
 }
 
 mod attachments;
+mod metal_texture;
 mod pool;
 
 pub use attachments::*;
+pub use metal_texture::*;
 pub use pool::*;
 
 fn aligned(value: usize, alignment: usize) -> Option<usize> {
