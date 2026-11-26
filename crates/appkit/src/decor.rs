@@ -89,9 +89,14 @@ impl Config {
     }
 
     /// Where the windows show the menus now: nowhere while the desktop's
-    /// global menu bar has them.
-    pub fn shown_menu(self) -> MenuPlacement {
-        match self.global && crate::globalmenu::in_use() {
+    /// global menu bar has them, except over a full-screen window, which
+    /// hides that bar.
+    pub fn shown_menu(self, full_screen: bool) -> MenuPlacement {
+        self.placement(!full_screen && crate::globalmenu::in_use())
+    }
+
+    fn placement(self, on_desktop: bool) -> MenuPlacement {
+        match self.global && on_desktop {
             true => MenuPlacement::Hidden,
             false => self.menu,
         }
@@ -159,6 +164,8 @@ pub(crate) struct Facts {
     pub resizable: bool,
     pub panel: bool,
     pub fullscreen: bool,
+    /// Drawn as the full-screen reveal, as if the window were not full screen.
+    pub revealed: bool,
     pub shown: bool,
     pub key: bool,
     pub title: String,
@@ -171,15 +178,21 @@ pub(crate) struct Facts {
 
 /// The height of chrome above a window's content, in points.
 pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: bool) -> f64 {
-    if !titled || fullscreen {
-        return 0.0;
+    match titled && !fullscreen {
+        true => chrome_height(config, panel, false),
+        false => 0.0,
     }
+}
+
+/// The height of a titled window's chrome, drawn above its content or, when
+/// `revealed`, over a full-screen window.
+fn chrome_height(config: Config, panel: bool, revealed: bool) -> f64 {
     let theme = theme();
     let titlebar = match config.decorations {
         Decorations::Client => theme.titlebar_height,
         Decorations::Server => 0.0,
     };
-    let strip = match config.shown_menu() == MenuPlacement::Strip && !panel {
+    let strip = match config.shown_menu(revealed) == MenuPlacement::Strip && !panel {
         true => theme.strip_height,
         false => 0.0,
     };
@@ -188,7 +201,10 @@ pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: b
 
 fn rows(config: Config, facts: &Facts) -> (f32, f32) {
     let theme = theme();
-    let inset = inset_for(config, facts.titled, facts.panel, facts.fullscreen) as f32;
+    let inset = match facts.titled && !facts.fullscreen {
+        true => chrome_height(config, facts.panel, facts.revealed),
+        false => 0.0,
+    } as f32;
     let titlebar = match config.decorations == Decorations::Client && inset > 0.0 {
         true => theme.titlebar_height,
         false => 0.0,
@@ -519,7 +535,8 @@ fn menu_titles() -> Vec<(Id, MenuTitle)> {
 
 fn models(config: Config, facts: &Facts, window: Id) -> (Option<Bar>, Option<Bar>) {
     let (titlebar_height, strip_height) = rows(config, facts);
-    let menus: Vec<MenuTitle> = match config.shown_menu() == MenuPlacement::Hidden || facts.panel {
+    let hidden = config.shown_menu(facts.revealed) == MenuPlacement::Hidden;
+    let menus: Vec<MenuTitle> = match hidden || facts.panel {
         true => Vec::new(),
         false => menu_titles().into_iter().map(|(_, title)| title).collect(),
     };
@@ -587,6 +604,7 @@ pub(crate) fn pump() {
         let revealed = facts.fullscreen && revealing == Some(window);
         if revealed {
             facts.fullscreen = false;
+            facts.revealed = true;
             // AppKit disables minimizing a full-screen window.
             facts.miniaturizable = false;
         }
@@ -1090,7 +1108,7 @@ pub(crate) fn reveal_popup() -> Option<sdl3::Window> {
 /// its top: at the top edge the chrome slides in, and once the pointer is
 /// below it again the chrome slides out.
 fn full_screen_pointer(window: Id, y: f32) {
-    if inset_for(config(), true, false, false) <= 0.0 {
+    if chrome_height(config(), false, true) <= 0.0 {
         return;
     }
     // SAFETY: a window this crate made.
@@ -1830,6 +1848,15 @@ mod tests {
         for menu in ["titlebar", "strip", "none"] {
             assert!(!Config::parse(None, Some(menu)).global, "{menu}");
         }
+    }
+
+    #[test]
+    fn the_desktop_menu_bar_takes_the_menus_only_in_global_mode() {
+        let global = Config::parse(Some("server"), None);
+        assert_eq!(global.placement(true), MenuPlacement::Hidden);
+        assert_eq!(global.placement(false), MenuPlacement::Strip);
+        let strip = Config::parse(Some("server"), Some("strip"));
+        assert_eq!(strip.placement(true), MenuPlacement::Strip);
     }
 
     #[test]

@@ -1384,6 +1384,7 @@ pub(crate) fn facts(object: Id) -> Option<crate::decor::Facts> {
         resizable: mask & style::RESIZABLE != 0,
         panel: is_panel(object),
         fullscreen: is_fullscreen(sdl),
+        revealed: false,
         shown: window.shown != 0 && window.miniaturized == 0,
         key: key_window() == object,
         title: sdl3::video::window_title(sdl)
