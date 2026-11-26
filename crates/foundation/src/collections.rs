@@ -1339,13 +1339,13 @@ unsafe extern "C" fn new_array(_class: Id, _sel: Sel) -> Id {
     collections::new_array(&[], Policy::from_type_callbacks(), true) as Id
 }
 
-unsafe extern "C" fn array_fn(_class: Id, _sel: Sel) -> Id {
+unsafe extern "C" fn array_fn(class: Id, _sel: Sel) -> Id {
     // SAFETY: a fresh object.
     unsafe {
         api::CFAutorelease(collections::new_array(
             &[],
             Policy::from_type_callbacks(),
-            true,
+            mutable_receiver(class, c"NSMutableArray"),
         )) as Id
     }
 }
@@ -1427,14 +1427,14 @@ unsafe extern "C" fn array_with_object(class: Id, _sel: Sel, object: Id) -> Id {
     }
 }
 
-unsafe extern "C" fn array_with_array(_class: Id, _sel: Sel, other: Id) -> Id {
+unsafe extern "C" fn array_with_array(class: Id, _sel: Sel, other: Id) -> Id {
     let values: Vec<CFTypeRef> = if other.is_null() {
         Vec::new()
     } else {
         // SAFETY: the argument is an array if it is one of ours.
         match unsafe { elements_of(other) } {
             Some(values) => values,
-            None => objc::fail!("+[NSMutableArray arrayWithArray:]: the argument is not an array"),
+            None => objc::fail!("+[NSArray arrayWithArray:]: the argument is not an array"),
         }
     };
     // SAFETY: a fresh object holding live ones.
@@ -1442,7 +1442,7 @@ unsafe extern "C" fn array_with_array(_class: Id, _sel: Sel, other: Id) -> Id {
         api::CFAutorelease(collections::new_array(
             &values,
             Policy::from_type_callbacks(),
-            true,
+            mutable_receiver(class, c"NSMutableArray"),
         )) as Id
     }
 }
@@ -3062,6 +3062,7 @@ pub(crate) fn install() {
     class_methods!(array, {
         "array" => array_fn, c"@16@0:8";
         "arrayWithObject:" => array_with_object, c"@24@0:8@16";
+        "arrayWithArray:" => array_with_array, c"@24@0:8@16";
         "arrayWithObjects:count:" => array_with_objects_count, c"@32@0:8^@16Q24";
         "arrayWithContentsOfFile:" => array_with_contents_of_file, c"@24@0:8@16";
         "arrayWithContentsOfURL:" => array_with_contents_of_url, c"@24@0:8@16";
