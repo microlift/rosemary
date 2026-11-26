@@ -27,6 +27,7 @@ pub mod filehandle;
 pub mod filemanager;
 pub mod formatter;
 pub mod geometry;
+pub mod indexpath;
 mod indexset;
 pub mod json;
 pub mod kvc;
@@ -73,6 +74,7 @@ pub fn bootstrap() {
         characterset::install();
         indexset::install();
         attributed_string::install();
+        indexpath::install();
         collections::install();
         enumeration::install();
         transformer::install();
