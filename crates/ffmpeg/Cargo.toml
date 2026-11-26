@@ -1,0 +1,9 @@
+[package]
+name = "ffmpeg"
+description = "libavcodec/libavutil, loaded at run time, shared by the media decoding backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
