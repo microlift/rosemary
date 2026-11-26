@@ -688,9 +688,13 @@ impl Builder<'_> {
     /// A new object for an entry, which [`Builder::instantiate`] remembers.
     fn create(&mut self, uid: Uid) -> Option<Id> {
         Some(match self.archive.class_name(uid) {
-            // A plain entry that is a string is a string, and the archive holds
-            // its text rather than an object to build.
-            None => foundation::string::from_str(self.archive.string(uid)?),
+            // A plain entry is a string or a number, and the archive holds its
+            // value rather than an object to build.
+            None => match self.archive.string(uid) {
+                Some(text) => foundation::string::from_str(text),
+                None => self.number(uid)?,
+            },
+            Some("NSNumber") => self.number(uid)?,
             // Values an archive holds by content, such as a binding's options:
             // allocating the class would make an empty one.
             Some("NSString" | "NSMutableString" | "NSLocalizableString") => {
@@ -758,6 +762,26 @@ impl Builder<'_> {
                 object
             }
         })
+    }
+
+    /// An `NSNumber` of an entry's value, retained.
+    fn number(&self, uid: Uid) -> Option<Id> {
+        let class = objc::class::ptr(objc::class::lookup(c"NSNumber")?) as Id;
+        // SAFETY: `+numberWith...:` are `id (Class, SEL, T)`; the number is
+        // autoreleased, so retained for the loader to own as it does the rest.
+        let number = unsafe {
+            if let Some(value) = self.archive.integer(uid) {
+                let f: unsafe extern "C" fn(Id, objc::sel::Sel, i64) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(class, objc::sel::get("numberWithLongLong:"), value)
+            } else {
+                let value = self.archive.real(uid)?;
+                let f: unsafe extern "C" fn(Id, objc::sel::Sel, f64) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(class, objc::sel::get("numberWithDouble:"), value)
+            }
+        };
+        Some(objc::arc::retain(number))
     }
 
     /// An instance of `name`, or of a class invented for it.

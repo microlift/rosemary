@@ -250,6 +250,19 @@ impl Archive {
         }
     }
 
+    /// A number with a fractional part: an `NSNumber` archived as a double
+    /// (`NS.dblval` in a nib), or a real written into the table directly.
+    pub fn real(&self, uid: Uid) -> Option<f64> {
+        let value = match self.nib_objects.is_empty() {
+            true => self.value(uid)?,
+            false => self.field(uid, "NS.dblval")?,
+        };
+        match value {
+            Value::Real(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// How many entries the table has, for a caller reporting on a whole file.
     pub fn len(&self) -> usize {
         if self.nib_objects.is_empty() {
