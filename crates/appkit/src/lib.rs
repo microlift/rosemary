@@ -513,8 +513,14 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSMenuDidBeginTrackingNotification",
     "NSMenuDidEndTrackingNotification",
     "NSWorkspaceDidActivateApplicationNotification",
-    // Observed by Max; nothing hides the application here.
+    // Observed by Max and CrossOver; nothing hides the application or calls
+    // `-updateWindows` here.
     "NSApplicationWillUnhideNotification",
+    "NSApplicationDidUnhideNotification",
+    "NSApplicationWillHideNotification",
+    "NSApplicationDidHideNotification",
+    "NSApplicationWillUpdateNotification",
+    "NSApplicationDidUpdateNotification",
     // Keys and option names whose text is their own name.
     "NSApplicationLaunchUserNotificationKey",
     "NSAccessibilityException",
@@ -559,6 +565,11 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         workspace::LAUNCH_ARCHITECTURE,
     ),
     ("_NSDeviceIsScreen", "NSDeviceIsScreen"),
+    ("_NSWorkspaceRecycleOperation", "recycle"),
+    ("_NSImageHintInterpolation", "NSImageHintInterpolation"),
+    ("_NSCharacterEncodingDocumentOption", "CharacterEncoding"),
+    ("_NSDraggingImageComponentLabelKey", "label"),
+    ("_NSDraggingImageComponentIconKey", "icon"),
     ("_NSDragPboard", "Apple CFPasteboard drag"),
     ("_NSEventTrackingRunLoopMode", "NSEventTrackingRunLoopMode"),
     ("_NSPrintPanelAccessorySummaryItemNameKey", "name"),
@@ -591,6 +602,10 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_kUTTypeFolder", "public.folder"),
     ("_kUTTypeApplicationBundle", "com.apple.application-bundle"),
     ("_kLSItemDisplayName", "LSItemDisplayName"),
+    (
+        "_kLSSharedFileListSessionLoginItems",
+        launchservices::SESSION_LOGIN_ITEMS,
+    ),
     // Dragged files arrive as this type; the guest compares pasteboard types to it.
     ("_kUTTypeFileURL", "public.file-url"),
     // SDL's clipboard offers text under this type and maps MIME types through
@@ -968,6 +983,7 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "NSStopProgressFreestandingTemplate",
     ),
     ("_NSImageNameComputer", "NSComputer"),
+    ("_NSImageNameCaution", "NSCaution"),
     ("_NSImageNameMultipleDocuments", "NSMultipleDocuments"),
     ("_NSImageNameStatusAvailable", "NSStatusAvailable"),
     ("_NSImageNameStatusUnavailable", "NSStatusUnavailable"),

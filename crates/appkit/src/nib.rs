@@ -170,17 +170,38 @@ impl Loaded {
     }
 }
 
+/// The archive a `.nib` directory holds for the running system: the
+/// `keyedobjects-NNNNNN.nib` built for the newest macOS not newer than this
+/// one - `101500` is 10.15, `110000` is 11 - or else `keyedobjects.nib`.
+fn archive_in(directory: &Path) -> std::path::PathBuf {
+    let (major, minor, patch) = darwin::sysctl::macos_version();
+    let running = i64::from(major) * 10_000 + i64::from(minor) * 100 + i64::from(patch);
+    let newest = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let version: i64 = name
+                .to_str()?
+                .strip_prefix("keyedobjects-")?
+                .strip_suffix(".nib")?
+                .parse()
+                .ok()?;
+            (version <= running).then_some((version, entry.path()))
+        })
+        .max_by_key(|(version, _)| *version);
+    newest.map_or_else(|| directory.join("keyedobjects.nib"), |(_, path)| path)
+}
+
 /// Read the nib at `path` and wire it, with `owner` standing in for File's
 /// Owner.
 ///
 /// `path` may be a file or a `.nib` directory, which is how a modern Xcode
-/// writes one. In the directory case the `keyedobjects.nib` inside it is the
-/// archive; a sibling `keyedobjects-NNNNNN.nib` is the same document in the
-/// `NIBArchive` format, which is a different format entirely and is not read
-/// here.
+/// writes one - see [`archive_in`] for which file in it is read.
 pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
     let file = match path.is_dir() {
-        true => path.join("keyedobjects.nib"),
+        true => archive_in(path),
         false => path.to_path_buf(),
     };
     let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -217,6 +238,30 @@ pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
     builder.show_visible_windows(root);
     builder.awake();
     Ok(builder.loaded)
+}
+
+/// `NSApp`, made by `+sharedApplication` if need be, when `name` is
+/// `NSApplication` or a subclass of it.
+fn shared_application_for(name: &str) -> Option<Id> {
+    let application = objc::class::lookup(c"NSApplication")?;
+    let class = objc::class::look_up(&std::ffi::CString::new(name).ok()?)?;
+    let mut ancestor = Some(class);
+    while let Some(current) = ancestor {
+        if std::ptr::eq(current, application) {
+            // SAFETY: `+sharedApplication` is `id (Class, SEL)`.
+            let app = unsafe {
+                let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    objc::class::ptr(class) as Id,
+                    objc::sel::get("sharedApplication"),
+                )
+            };
+            return (!app.is_null()).then_some(app);
+        }
+        ancestor = current.superclass();
+    }
+    None
 }
 
 /// Whether something implements a class of this name.
@@ -290,12 +335,68 @@ impl Builder<'_> {
                     let destination = self.archive.field_object(connector, "NSDestination");
                     self.action(source, destination, &label, &source_class);
                 }
+                "NSNibBindingConnector" => self.binding(connector, source, &label),
                 other => self
                     .loaded
                     .unwired
                     .push(format!("a connector of an unknown kind, {other}")),
             }
         }
+    }
+
+    /// `[source bind:binding toObject:destination withKeyPath:keyPath
+    /// options:options]`: a Cocoa binding made in Interface Builder.
+    fn binding(&mut self, connector: Uid, source: Uid, label: &str) {
+        let text = |builder: &Self, key: &str| {
+            builder
+                .archive
+                .field_object(connector, key)
+                .and_then(|uid| builder.archive.string(uid))
+                .map(str::to_string)
+        };
+        let (Some(binding), Some(key_path)) = (text(self, "NSBinding"), text(self, "NSKeyPath"))
+        else {
+            self.loaded.unwired.push(format!(
+                "the binding \"{label}\" names no binding or key path"
+            ));
+            return;
+        };
+        let destination = self.archive.field_object(connector, "NSDestination");
+        let (Some(object), Some(observed)) = (
+            self.instantiate(source),
+            destination.and_then(|uid| self.instantiate(uid)),
+        ) else {
+            self.loaded.unwired.push(format!(
+                "the binding \"{label}\" is not connected: an end was not built"
+            ));
+            return;
+        };
+        let options = self
+            .archive
+            .field_object(connector, "NSOptions")
+            .and_then(|uid| self.instantiate(uid))
+            .unwrap_or(std::ptr::null_mut());
+        let (binding, key_path) = (
+            foundation::string::from_str(&binding),
+            foundation::string::from_str(&key_path),
+        );
+        // SAFETY: `-bind:toObject:withKeyPath:options:` is
+        // `void (id, SEL, NSString *, id, NSString *, NSDictionary *)`, which
+        // `NSObject` answers here.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                object,
+                objc::sel::get("bind:toObject:withKeyPath:options:"),
+                binding,
+                observed,
+                key_path,
+                options,
+            );
+        }
+        objc::arc::release(binding);
+        objc::arc::release(key_path);
     }
 
     /// Build the menus the nib names for the application - its menu bar
@@ -551,8 +652,56 @@ impl Builder<'_> {
             // A plain entry that is a string is a string, and the archive holds
             // its text rather than an object to build.
             None => foundation::string::from_str(self.archive.string(uid)?),
+            // Values an archive holds by content, such as a binding's options:
+            // allocating the class would make an empty one.
+            Some("NSString" | "NSMutableString" | "NSLocalizableString") => {
+                foundation::string::from_str(self.archive.string(uid)?)
+            }
+            Some(kind @ ("NSArray" | "NSMutableArray")) => {
+                let mutable = kind == "NSMutableArray";
+                let elements: Vec<_> = self
+                    .archive
+                    .array(uid)
+                    .into_iter()
+                    .filter_map(|element| self.instantiate(element))
+                    .map(|object| object as corefoundation::base::CFTypeRef)
+                    .collect();
+                corefoundation::collections::new_array(
+                    &elements,
+                    corefoundation::callbacks::Policy::from_type_callbacks(),
+                    mutable,
+                ) as Id
+            }
+            Some(kind @ ("NSDictionary" | "NSMutableDictionary")) => {
+                let mutable = kind == "NSMutableDictionary";
+                let pairs: Vec<_> = self
+                    .archive
+                    .dictionary(uid)
+                    .into_iter()
+                    .filter_map(|(key, value)| {
+                        Some((self.instantiate(key)?, self.instantiate(value)?))
+                    })
+                    .map(|(key, value)| {
+                        (
+                            key as corefoundation::base::CFTypeRef,
+                            value as corefoundation::base::CFTypeRef,
+                        )
+                    })
+                    .collect();
+                corefoundation::collections::new_dictionary(
+                    &pairs,
+                    corefoundation::callbacks::Policy::from_key_callbacks(),
+                    corefoundation::callbacks::Policy::from_type_callbacks(),
+                    mutable,
+                ) as Id
+            }
             Some("NSCustomObject") => {
                 let name = self.custom_class_name(uid)?;
+                // The application placeholder is the application, as AppKit's
+                // `NSCustomObject` answers, never a second instance of it.
+                if let Some(app) = shared_application_for(&name) {
+                    return Some(app);
+                }
                 self.build(&name)
             }
             // A swapper of a plain object - an "Object" given a custom class in

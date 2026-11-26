@@ -348,8 +348,179 @@ pub unsafe extern "C" fn LSOpenFromURLSpec(
     }
 }
 
+/// `LSRolesMask`, and the `CFBundleTypeRole` each bit is.
+const ROLES: &[(u32, &str)] = &[
+    (0x1, "None"),
+    (0x2, "Viewer"),
+    (0x4, "Editor"),
+    (0x8, "Shell"),
+];
+
+/// Whether the running application's `Info.plist` claims documents of
+/// `content_type` in one of the roles in `roles`.
+fn main_claims_type(content_type: &str, roles: u32) -> bool {
+    let Some(layout) = foundation::bundle::main() else {
+        return false;
+    };
+    let in_role = |entry: &foundation::plist::Value| {
+        let role = entry
+            .get("CFBundleTypeRole")
+            .and_then(|r| r.as_str())
+            .unwrap_or("Editor");
+        ROLES
+            .iter()
+            .any(|(bit, name)| roles & bit != 0 && role.eq_ignore_ascii_case(name))
+    };
+    layout
+        .info
+        .get("CFBundleDocumentTypes")
+        .and_then(|types| types.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|entry| in_role(entry))
+        .filter_map(|entry| entry.get("LSItemContentTypes")?.as_array())
+        .flatten()
+        .filter_map(|t| t.as_str())
+        .any(|claimed| claimed.eq_ignore_ascii_case(content_type))
+}
+
+/// A one-element array of `object`, which it takes the caller's reference to.
+fn sole(object: CFTypeRef) -> CFTypeRef {
+    let array = corefoundation::collections::new_array(
+        &[object],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: the caller's reference, now held by the array.
+    unsafe { corefoundation::api::CFRelease(object) };
+    array
+}
+
+/// `CFArrayRef LSCopyAllRoleHandlersForContentType(CFStringRef, LSRolesMask)`:
+/// the running application, the only one registered, if it claims the type.
+unsafe extern "C" fn LSCopyAllRoleHandlersForContentType(
+    content_type: CFTypeRef,
+    roles: u32,
+) -> CFTypeRef {
+    let claimed = text(content_type).is_some_and(|t| main_claims_type(&t, roles));
+    match claimed.then(main_identifier).flatten() {
+        Some(identifier) => sole(string(&identifier)),
+        None => std::ptr::null(),
+    }
+}
+
+/// `CFArrayRef LSCopyApplicationURLsForURL(CFURLRef, LSRolesMask)`: the
+/// running application, if it claims the URL's scheme or, for a file, its
+/// type.
+unsafe extern "C" fn LSCopyApplicationURLsForURL(url: CFTypeRef, roles: u32) -> CFTypeRef {
+    // SAFETY: a URL or null.
+    let Some(url) = (unsafe { corefoundation::url::as_url(url) }) else {
+        return std::ptr::null();
+    };
+    let claimed = match url.file_path() {
+        Some(path) => std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|e| {
+                corefoundation::uti::identifier_for(corefoundation::uti::FILENAME_EXTENSION, e)
+            })
+            .is_some_and(|t| main_claims_type(&t, roles)),
+        None => main_claims(&url.scheme()),
+    };
+    match claimed.then(main_url).flatten() {
+        Some(application) => sole(application),
+        None => std::ptr::null(),
+    }
+}
+
+/// `OSStatus LSRegisterURL(CFURLRef, Boolean update)`.
+///
+/// FIXME (ACCURACY): nothing is recorded: the only application registered is
+/// the running one, so a bundle registered here is never answered for.
+unsafe extern "C" fn LSRegisterURL(url: CFTypeRef, _update: u8) -> OSStatus {
+    match url.is_null() {
+        true => PARAM_ERR,
+        false => NO_ERR,
+    }
+}
+
+/// `kLSSharedFileListSessionLoginItems`'s value.
+pub const SESSION_LOGIN_ITEMS: &str = "com.apple.LSSharedFileList.SessionLoginItems";
+
+fn shared_file_list_class() -> &'static objc::class::Class {
+    corefoundation::base::register(c"LSSharedFileList", None, size_of::<usize>(), true)
+}
+
+/// `LSSharedFileListRef LSSharedFileListCreate(CFAllocatorRef, CFStringRef
+/// listType, CFTypeRef listOptions)`
+///
+/// A list of what this host has registered, which is nothing: no login item
+/// or favorite is kept here, so every list is empty.
+unsafe extern "C" fn LSSharedFileListCreate(
+    _allocator: CFTypeRef,
+    list_type: CFTypeRef,
+    _options: CFTypeRef,
+) -> CFTypeRef {
+    if list_type.is_null() {
+        return std::ptr::null();
+    }
+    objc::object::create_instance(shared_file_list_class(), 0) as CFTypeRef
+}
+
+/// The seed a snapshot reports, which changes when a list does; these never do.
+const SNAPSHOT_SEED: u32 = 1;
+
+/// `CFArrayRef LSSharedFileListCopySnapshot(LSSharedFileListRef, UInt32 *seed)`
+unsafe extern "C" fn LSSharedFileListCopySnapshot(list: CFTypeRef, seed: *mut u32) -> CFTypeRef {
+    if list.is_null() {
+        return std::ptr::null();
+    }
+    if !seed.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { seed.write(SNAPSHOT_SEED) };
+    }
+    corefoundation::collections::new_array(
+        &[],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    )
+}
+
+/// `OSStatus LSSharedFileListItemRemove(LSSharedFileListRef,
+/// LSSharedFileListItemRef)`: no item is ever handed out, so none is one.
+unsafe extern "C" fn LSSharedFileListItemRemove(_list: CFTypeRef, _item: CFTypeRef) -> OSStatus {
+    PARAM_ERR
+}
+
+/// `CFStringRef LSSharedFileListItemCopyDisplayName(LSSharedFileListItemRef)`
+unsafe extern "C" fn LSSharedFileListItemCopyDisplayName(_item: CFTypeRef) -> CFTypeRef {
+    std::ptr::null()
+}
+
+/// `CFURLRef LSSharedFileListItemCopyResolvedURL(LSSharedFileListItemRef,
+/// LSSharedFileListResolutionFlags, CFErrorRef *)`
+unsafe extern "C" fn LSSharedFileListItemCopyResolvedURL(
+    _item: CFTypeRef,
+    _flags: u32,
+    error: *mut CFTypeRef,
+) -> CFTypeRef {
+    if !error.is_null() {
+        // SAFETY: writable, per the caller.
+        unsafe { error.write(std::ptr::null()) };
+    }
+    std::ptr::null()
+}
+
 exports::exports! {
     functions {
+        "LSCopyAllRoleHandlersForContentType" => LSCopyAllRoleHandlersForContentType,
+        "LSCopyApplicationURLsForURL" => LSCopyApplicationURLsForURL,
+        "LSRegisterURL" => LSRegisterURL,
+        "LSSharedFileListCreate" => LSSharedFileListCreate,
+        "LSSharedFileListCopySnapshot" => LSSharedFileListCopySnapshot,
+        "LSSharedFileListItemRemove" => LSSharedFileListItemRemove,
+        "LSSharedFileListItemCopyDisplayName" => LSSharedFileListItemCopyDisplayName,
+        "LSSharedFileListItemCopyResolvedURL" => LSSharedFileListItemCopyResolvedURL,
         "LSCopyDefaultHandlerForURLScheme" => LSCopyDefaultHandlerForURLScheme,
         "LSCopyAllHandlersForURLScheme" => LSCopyAllHandlersForURLScheme,
         "LSSetDefaultHandlerForURLScheme" => LSSetDefaultHandlerForURLScheme,

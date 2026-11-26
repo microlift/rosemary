@@ -1123,6 +1123,27 @@ unsafe extern "C" fn field_string_value(receiver: Id, _sel: Sel) -> Id {
     objc::arc::autorelease(foundation::string::from_str(&field(receiver).text))
 }
 
+/// `-objectValue`: with no formatter, the field's string.
+unsafe extern "C" fn field_object_value(receiver: Id, sel: Sel) -> Id {
+    // SAFETY: the same receiver.
+    unsafe { field_string_value(receiver, sel) }
+}
+
+/// `-setObjectValue:`: with no formatter, the value's `-description` - which
+/// a string answers with itself - and the empty string for nil.
+unsafe extern "C" fn field_set_object_value(receiver: Id, sel: Sel, value: Id) {
+    let text = match value.is_null() {
+        true => std::ptr::null_mut(),
+        // SAFETY: `-description` is `id (id, SEL)` on any object.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(value, objc::sel::get("description"))
+        },
+    };
+    // SAFETY: the same receiver, and a string or nil.
+    unsafe { field_set_string_value(receiver, sel, text) }
+}
+
 unsafe extern "C" fn field_set_string_value(receiver: Id, _sel: Sel, value: Id) {
     // SAFETY: null or an NSString, as the selector requires.
     let text = String::from_utf8_lossy(&unsafe { foundation::string::bytes(value) }).into_owned();
@@ -1662,6 +1683,8 @@ pub(crate) fn install() {
     methods!(field, {
         "stringValue" => field_string_value, c"@16@0:8";
         "setStringValue:" => field_set_string_value, c"v24@0:8@16";
+        "objectValue" => field_object_value, c"@16@0:8";
+        "setObjectValue:" => field_set_object_value, c"v24@0:8@16";
         "setEditable:" => field_set_editable, c"v20@0:8c16";
         "isEditable" => field_is_editable, c"c16@0:8";
         "setSelectable:" => field_set_selectable, c"v20@0:8c16";

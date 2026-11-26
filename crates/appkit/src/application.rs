@@ -96,14 +96,31 @@ unsafe extern "C" fn shared_application(class: Id, _sel: Sel) -> Id {
         return std::ptr::null_mut();
     };
     let app = objc::object::create_instance(class, 0);
+    publish(app);
+    // `[[self alloc] init]`, so a subclass's `-init` runs. `NSApp` is already
+    // set, as Apple sets it inside `-[NSApplication init]`, for an `-init`
+    // that reaches for it.
+    let sel = objc::sel::get("init");
+    // SAFETY: `-init` is `id (id, SEL)`.
+    let initialized = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(app, sel)
+    };
+    if !initialized.is_null() && initialized != app {
+        publish(initialized);
+    }
+    register_application_fonts();
+    shared()
+}
+
+/// Make `app` the shared application and `NSApp`.
+fn publish(app: Id) {
     // Retained forever: `NSApp` is a process-lifetime global, and an application
     // a guest can release is one it can make dangle.
     objc::arc::make_immortal(app);
     SHARED.store(app as usize, std::sync::atomic::Ordering::Release);
     // SAFETY: the cell is this crate's own, and the guest reads it as `NSApp`.
     unsafe { *(crate::ns_app_cell() as *mut u64) = app as usize as u64 };
-    register_application_fonts();
-    app
 }
 
 /// The fonts `ATSApplicationFontsPath` names, which a Mac makes available to

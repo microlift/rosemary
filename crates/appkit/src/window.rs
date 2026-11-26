@@ -106,6 +106,8 @@ pub struct Window {
     frame_view: Id,
     /// `-titlebarAccessoryViewControllers`, an owned mutable array or null.
     accessories: Id,
+    /// `-frameAutosaveName`, an owned copy, or null for none.
+    autosave_name: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -2328,6 +2330,34 @@ unsafe extern "C" fn set_represented_url(receiver: Id, _sel: Sel, url: Id) {
     objc::arc::release(old);
 }
 
+/// `-setFrameAutosaveName:`, which keeps the name.
+///
+/// FIXME (ACCURACY): the frame is neither restored from nor saved to the user
+/// defaults under the name, as AppKit does.
+unsafe extern "C" fn set_frame_autosave_name(receiver: Id, _sel: Sel, name: Id) -> u8 {
+    let copy = match name.is_null() {
+        true => std::ptr::null_mut(),
+        false => {
+            // SAFETY: a string.
+            let text = unsafe { foundation::string::bytes(name) };
+            foundation::string::from_str(&String::from_utf8_lossy(&text))
+        }
+    };
+    objc::arc::release(std::mem::replace(
+        &mut window_of(receiver).autosave_name,
+        copy,
+    ));
+    1
+}
+
+/// `-frameAutosaveName`: the empty string for a window that has none.
+unsafe extern "C" fn frame_autosave_name(receiver: Id, _sel: Sel) -> Id {
+    match window_of(receiver).autosave_name {
+        name if name.is_null() => objc::arc::autorelease(foundation::string::from_str("")),
+        name => name,
+    }
+}
+
 unsafe extern "C" fn represented_url(receiver: Id, _sel: Sel) -> Id {
     window_of(receiver).represented_url
 }
@@ -2589,6 +2619,10 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     ));
     objc::arc::release(std::mem::replace(
         &mut window.represented_url,
+        std::ptr::null_mut(),
+    ));
+    objc::arc::release(std::mem::replace(
+        &mut window.autosave_name,
         std::ptr::null_mut(),
     ));
     let frame_view = std::mem::replace(&mut window.frame_view, std::ptr::null_mut());
@@ -3163,6 +3197,52 @@ unsafe extern "C" fn set_initial_first_responder(receiver: Id, _sel: Sel, respon
 
 unsafe extern "C" fn initial_first_responder(receiver: Id, _sel: Sel) -> Id {
     window_of(receiver).initial_first_responder
+}
+
+/// `-recalculateKeyViewLoop`: every visible view under the content view that
+/// accepts first responder, linked into a loop in reading order - top to
+/// bottom, then left to right, in the window's coordinates.
+unsafe extern "C" fn recalculate_key_view_loop(receiver: Id, _sel: Sel) {
+    fn collect(view: Id, out: &mut Vec<Id>) {
+        for child in crate::view::subviews_of(view) {
+            if crate::view::is_hidden_itself(child) {
+                continue;
+            }
+            out.push(child);
+            collect(child, out);
+        }
+    }
+    let mut views = Vec::new();
+    collect(content_view_of(receiver), &mut views);
+    // SAFETY: `-acceptsFirstResponder` is `BOOL (id, SEL)`, and
+    // `-setNextKeyView:` is `void (id, SEL, id)`, on any view.
+    let (accepts, set_next): (
+        unsafe extern "C" fn(Id, Sel) -> u8,
+        unsafe extern "C" fn(Id, Sel, Id),
+    ) = unsafe {
+        (
+            std::mem::transmute(objc::msg::entry()),
+            std::mem::transmute(objc::msg::entry()),
+        )
+    };
+    let accepts_sel = objc::sel::get("acceptsFirstResponder");
+    // SAFETY: live views of this window.
+    views.retain(|view| unsafe { accepts(*view, accepts_sel) } != 0);
+    let top_then_left = |view: &Id| {
+        let rect = crate::view::rect_in_window(*view);
+        (-(rect.origin.y + rect.size.height), rect.origin.x)
+    };
+    views.sort_by(|a, b| {
+        top_then_left(a)
+            .partial_cmp(&top_then_left(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let set_next_sel = objc::sel::get("setNextKeyView:");
+    for (i, view) in views.iter().enumerate() {
+        let next = views[(i + 1) % views.len()];
+        // SAFETY: as above.
+        unsafe { set_next(*view, set_next_sel, next) };
+    }
 }
 
 unsafe extern "C" fn make_first_responder(receiver: Id, _sel: Sel, responder: Id) -> u8 {
@@ -3813,10 +3893,6 @@ unsafe extern "C" fn no_with_object(_receiver: Id, _sel: Sel, _object: Id) -> u8
     0
 }
 
-unsafe extern "C" fn yes_with_object(_receiver: Id, _sel: Sel, _object: Id) -> u8 {
-    1
-}
-
 /// `NSWindowOcclusionStateVisible`: no compositor here reports occlusion.
 pub(crate) unsafe extern "C" fn visible_occlusion(_receiver: Id, _sel: Sel) -> u64 {
     1 << 1
@@ -4102,7 +4178,8 @@ pub(crate) fn install() {
         // Frames are not persisted, so a saved one is never there to restore.
         "saveFrameUsingName:" => ignored_integer, c"v24@0:8@16";
         "setFrameUsingName:" => no_with_object, c"c24@0:8@16";
-        "setFrameAutosaveName:" => yes_with_object, c"c24@0:8@16";
+        "setFrameAutosaveName:" => set_frame_autosave_name, c"c24@0:8@16";
+        "frameAutosaveName" => frame_autosave_name, c"@16@0:8";
         "stringWithSavedFrame" => string_with_saved_frame, c"@16@0:8";
         "setFrameFromString:" => set_frame_from_string, c"v24@0:8@16";
         // The textured bottom bar: no such chrome is drawn here.
@@ -4157,6 +4234,7 @@ pub(crate) fn install() {
         "firstResponder" => first_responder, c"@16@0:8";
         "makeFirstResponder:" => make_first_responder, c"c24@0:8@16";
         "initialFirstResponder" => initial_first_responder, c"@16@0:8";
+        "recalculateKeyViewLoop" => recalculate_key_view_loop, c"v16@0:8";
         "nextResponder" => next_responder, c"@16@0:8";
         "setNextResponder:" => set_next_responder, c"v24@0:8@16";
         "setInitialFirstResponder:" => set_initial_first_responder, c"v24@0:8@16";
