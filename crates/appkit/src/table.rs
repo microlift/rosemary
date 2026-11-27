@@ -156,7 +156,10 @@ pub(crate) fn delegate_of(receiver: Id) -> Id {
 }
 
 pub(crate) fn column_index(receiver: Id, column: Id) -> Option<usize> {
-    table(receiver).columns.iter().position(|c| *c == column as usize)
+    table(receiver)
+        .columns
+        .iter()
+        .position(|c| *c == column as usize)
 }
 
 pub(crate) fn column_at(receiver: Id, index: usize) -> Id {
@@ -942,7 +945,11 @@ fn set_row_highlight_style(row_view: Id, style: isize) {
     // SAFETY: `void (id, SEL, NSTableViewSelectionHighlightStyle)`.
     unsafe {
         let f: unsafe extern "C" fn(Id, Sel, isize) = std::mem::transmute(objc::msg::entry());
-        f(row_view, objc::sel::get("setSelectionHighlightStyle:"), style);
+        f(
+            row_view,
+            objc::sel::get("setSelectionHighlightStyle:"),
+            style,
+        );
     }
 }
 
@@ -1114,7 +1121,7 @@ unsafe extern "C" fn rect_of_row(receiver: Id, _sel: Sel, row: isize) -> NSRect 
     let span = match state.row_tops.is_empty() {
         true => {
             let pitch = state.row_height + state.spacing_height;
-            (row >= 0 && row < rows(receiver)).then(|| (row as f64 * pitch, pitch))
+            (row >= 0 && row < rows(receiver)).then_some((row as f64 * pitch, pitch))
         }
         false => usize::try_from(row)
             .ok()
@@ -1263,7 +1270,8 @@ fn make_row_view(receiver: Id, row: isize, frame: NSRect) -> Id {
     let made = send_id(objc::class::ptr(class) as Id, "alloc");
     // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id = std::mem::transmute(objc::msg::entry());
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
         f(made, objc::sel::get("initWithFrame:"), frame)
     }
 }
@@ -1276,7 +1284,11 @@ fn make_cell_view(receiver: Id, column: Id, row: isize) -> Id {
     // `id (id, SEL, NSOutlineView *, NSTableColumn *, id)`.
     unsafe {
         match crate::outline::is_outline(receiver) {
-            true if responds(delegate, objc::sel::get("outlineView:viewForTableColumn:item:")) => {
+            true if responds(
+                delegate,
+                objc::sel::get("outlineView:viewForTableColumn:item:"),
+            ) =>
+            {
                 let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
                     std::mem::transmute(objc::msg::entry());
                 f(
@@ -1287,7 +1299,12 @@ fn make_cell_view(receiver: Id, column: Id, row: isize) -> Id {
                     crate::outline::item_at(receiver, row),
                 )
             }
-            false if responds(delegate, objc::sel::get("tableView:viewForTableColumn:row:")) => {
+            false
+                if responds(
+                    delegate,
+                    objc::sel::get("tableView:viewForTableColumn:row:"),
+                ) =>
+            {
                 let f: unsafe extern "C" fn(Id, Sel, Id, Id, isize) -> Id =
                     std::mem::transmute(objc::msg::entry());
                 f(
@@ -1440,7 +1457,8 @@ fn make_rows(receiver: Id) {
     let (width, height) = match objc::class::lookup(c"NSClipView") {
         // SAFETY: a live view.
         Some(class)
-            if view::is_view(clip) && unsafe { corefoundation::base::is_kind_of(clip.cast(), class) } =>
+            if view::is_view(clip)
+                && unsafe { corefoundation::base::is_kind_of(clip.cast(), class) } =>
         {
             let visible = view::bounds_of(clip).size;
             (visible.width, bottom.max(visible.height))
@@ -1461,12 +1479,14 @@ fn make_rows(receiver: Id) {
     }
     fit_columns(receiver, width);
 
-    let old = std::mem::take(&mut tables()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(receiver as usize)
-        .or_default()
-        .row_views);
+    let old = std::mem::take(
+        &mut tables()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(receiver as usize)
+            .or_default()
+            .row_views,
+    );
     for (row, row_view) in old.into_iter().enumerate() {
         let row_view = row_view as Id;
         send_id(row_view, "removeFromSuperview");

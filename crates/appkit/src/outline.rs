@@ -130,7 +130,8 @@ fn expandable(receiver: Id, item: Id) -> bool {
     }
     // SAFETY: `BOOL (id, SEL, NSOutlineView *, id)`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> u8 = std::mem::transmute(objc::msg::entry());
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> u8 =
+            std::mem::transmute(objc::msg::entry());
         f(
             source,
             objc::sel::get("outlineView:isItemExpandable:"),
@@ -284,7 +285,8 @@ fn announce(receiver: Id, item: Id, expanded: bool) {
     // SAFETY: `+dictionaryWithObject:forKey:` is `id (Class, SEL, id, id)`.
     let info = unsafe {
         let class = objc::class::lookup(c"NSDictionary").expect("NSDictionary");
-        let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id = std::mem::transmute(objc::msg::entry());
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+            std::mem::transmute(objc::msg::entry());
         f(
             objc::class::ptr(class) as Id,
             objc::sel::get("dictionaryWithObject:forKey:"),
@@ -491,7 +493,12 @@ mod tests {
         // SAFETY: `void (id, SEL, id, NSString *)`.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
-            f(object, objc::sel::get("setValue:forKey:"), value, string(key));
+            f(
+                object,
+                objc::sel::get("setValue:forKey:"),
+                value,
+                string(key),
+            );
         }
     }
 
@@ -536,7 +543,12 @@ mod tests {
         send_id_id(controller, "setContent:", array(&[a, item("b", &[])]));
         let outline = send_id(send_id(class_named(c"NSOutlineView"), "alloc"), "init");
         bind(outline, "content", controller, "arrangedObjects");
-        bind(outline, "selectionIndexPaths", controller, "selectionIndexPaths");
+        bind(
+            outline,
+            "selectionIndexPaths",
+            controller,
+            "selectionIndexPaths",
+        );
         (outline, controller, a)
     }
 
@@ -549,8 +561,14 @@ mod tests {
         send_id_id(outline, "expandItem:", first);
         assert_eq!(send_word(outline, "numberOfRows"), 4);
         assert_eq!(integer(outline, "levelForRow:", 2), 1);
-        assert_eq!(name_of(send_id(item_at(outline, 2), "representedObject")), "a1");
-        assert_eq!(name_of(send_id(item_at(outline, 3), "representedObject")), "b");
+        assert_eq!(
+            name_of(send_id(item_at(outline, 2), "representedObject")),
+            "a1"
+        );
+        assert_eq!(
+            name_of(send_id(item_at(outline, 3), "representedObject")),
+            "b"
+        );
         send_id_id(outline, "collapseItem:", first);
         assert_eq!(send_word(outline, "numberOfRows"), 2);
     }
@@ -565,13 +583,24 @@ mod tests {
         // SAFETY: `void (id, SEL, NSIndexSet *, BOOL)`.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel, Id, u8) = std::mem::transmute(objc::msg::entry());
-            f(outline, objc::sel::get("selectRowIndexes:byExtendingSelection:"), set, 0);
+            f(
+                outline,
+                objc::sel::get("selectRowIndexes:byExtendingSelection:"),
+                set,
+                0,
+            );
         }
         let path = send_id(controller, "selectionIndexPath");
         assert_eq!(foundation::indexpath::indexes(path), &[1]);
     }
 
-    unsafe extern "C" fn view_for(_delegate: Id, _sel: Sel, _outline: Id, _column: Id, _item: Id) -> Id {
+    unsafe extern "C" fn view_for(
+        _delegate: Id,
+        _sel: Sel,
+        _outline: Id,
+        _column: Id,
+        _item: Id,
+    ) -> Id {
         let cell = send_id(class_named(c"NSTableCellView"), "alloc");
         objc::arc::autorelease(send_id(cell, "init"))
     }
@@ -579,18 +608,19 @@ mod tests {
     #[test]
     fn a_view_based_outline_makes_a_row_view_holding_each_rows_cell() {
         let (outline, _controller, a) = bound_outline();
-        let delegate_class = objc::class::lookup(c"RosemaryTestOutlineDelegate").unwrap_or_else(|| {
-            let class = corefoundation::base::register(
-                c"RosemaryTestOutlineDelegate",
-                None,
-                size_of::<usize>(),
-                false,
-            );
-            methods!(class, {
-                "outlineView:viewForTableColumn:item:" => view_for, c"@40@0:8@16@24@32";
+        let delegate_class =
+            objc::class::lookup(c"RosemaryTestOutlineDelegate").unwrap_or_else(|| {
+                let class = corefoundation::base::register(
+                    c"RosemaryTestOutlineDelegate",
+                    None,
+                    size_of::<usize>(),
+                    false,
+                );
+                methods!(class, {
+                    "outlineView:viewForTableColumn:item:" => view_for, c"@40@0:8@16@24@32";
+                });
+                class
             });
-            class
-        });
         let delegate = objc::object::create_instance(delegate_class, 0);
         let column = send_id(class_named(c"NSTableColumn"), "alloc");
         send_id_id(outline, "addTableColumn:", send_id(column, "init"));
@@ -601,7 +631,13 @@ mod tests {
         let cell = unsafe {
             let f: unsafe extern "C" fn(Id, Sel, isize, isize, u8) -> Id =
                 std::mem::transmute(objc::msg::entry());
-            f(outline, objc::sel::get("viewAtColumn:row:makeIfNecessary:"), 0, 0, 0)
+            f(
+                outline,
+                objc::sel::get("viewAtColumn:row:makeIfNecessary:"),
+                0,
+                0,
+                0,
+            )
         };
         assert_eq!(send_id(cell, "objectValue"), a);
         assert_eq!(send_word(send_id(cell, "superview"), "isSelected") as u8, 1);

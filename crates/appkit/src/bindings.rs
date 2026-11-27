@@ -744,7 +744,12 @@ mod tests {
         // SAFETY: `void (id, SEL, id, NSString *)`.
         unsafe {
             let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
-            f(object, objc::sel::get("setValue:forKey:"), boolean(value), key);
+            f(
+                object,
+                objc::sel::get("setValue:forKey:"),
+                boolean(value),
+                key,
+            );
         }
         crate::tree_controller::announce(object, "didChangeValueForKey:", name);
         release_string(key);
@@ -753,7 +758,16 @@ mod tests {
     fn bind(view: Id, name: &str, model: Id, key_path: &str) {
         let (name, key_path) = (string(name), string(key_path));
         // SAFETY: the receiver's own method.
-        unsafe { super::bind(view, std::ptr::null(), name, model, key_path, std::ptr::null_mut()) };
+        unsafe {
+            super::bind(
+                view,
+                std::ptr::null(),
+                name,
+                model,
+                key_path,
+                std::ptr::null_mut(),
+            )
+        };
         release_string(name);
         release_string(key_path);
     }

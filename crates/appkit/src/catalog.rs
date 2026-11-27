@@ -504,7 +504,10 @@ mod tests {
         bitmap.extend(0u32.to_le_bytes());
         bitmap.extend(DEEPMAP2.to_le_bytes());
         let catalog = Catalog::parse(&store_of(LAYOUT_IMAGE, b"BGRA", &bitmap)).expect("a store");
-        let refused = catalog.image("Tint", false).expect("an asset").expect_err("refused");
+        let refused = catalog
+            .image("Tint", false)
+            .expect("an asset")
+            .expect_err("refused");
         assert!(refused.contains("deepmap2"), "{refused}");
     }
 

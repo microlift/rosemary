@@ -243,7 +243,13 @@ unsafe extern "C" fn intrinsic_content_size(receiver: Id, _sel: Sel) -> NSSize {
 }
 
 /// The lines a wrapping field breaks `text` into, `room` points wide.
-fn wrapped_lines(look: &Look, font: &chrome::Font, size: f32, text: &str, room: f32) -> Vec<String> {
+fn wrapped_lines(
+    look: &Look,
+    font: &chrome::Font,
+    size: f32,
+    text: &str,
+    room: f32,
+) -> Vec<String> {
     let mut lines = match look.line_break {
         CHAR_WRAP => char_wrap(font, text, size, room),
         _ => font.wrap(text, size, room),
@@ -271,7 +277,10 @@ fn baselines(receiver: Id) -> (f64, f64) {
             let room = (bounds.size.width as f32 - 2.0 * PADDING as f32).max(0.0);
             let lines = wrapped_lines(&look, &font, size, &text, room).len().max(1);
             let first = ascent.round();
-            (first, first + (lines - 1) as f32 * (ascent + descent).ceil())
+            (
+                first,
+                first + (lines - 1) as f32 * (ascent + descent).ceil(),
+            )
         }
         false => {
             let baseline = font.centered_baseline(size, 0.0, height);

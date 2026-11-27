@@ -528,7 +528,8 @@ fn table_details(builder: &mut dyn Builder, uid: Uid, view: Id) {
         .field_object(uid, "NSTableViewArchivedReusableViewsKey")
     {
         for (identifier, nib) in builder.archive().dictionary(nibs) {
-            let (Some(identifier), Some(nib)) = (builder.object_at(identifier), builder.object_at(nib))
+            let (Some(identifier), Some(nib)) =
+                (builder.object_at(identifier), builder.object_at(nib))
             else {
                 continue;
             };
@@ -536,7 +537,12 @@ fn table_details(builder: &mut dyn Builder, uid: Uid, view: Id) {
             unsafe {
                 let f: unsafe extern "C" fn(Id, Sel, Id, Id) =
                     std::mem::transmute(objc::msg::entry());
-                f(view, objc::sel::get("registerNib:forIdentifier:"), nib, identifier);
+                f(
+                    view,
+                    objc::sel::get("registerNib:forIdentifier:"),
+                    nib,
+                    identifier,
+                );
             }
         }
     }
@@ -641,7 +647,12 @@ fn stack_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
                 unsafe {
                     let f: unsafe extern "C" fn(Id, Sel, Id, usize) =
                         std::mem::transmute(objc::msg::entry());
-                    f(view, objc::sel::get("addView:inGravity:"), arranged, gravity);
+                    f(
+                        view,
+                        objc::sel::get("addView:inGravity:"),
+                        arranged,
+                        gravity,
+                    );
                 }
             }
         }
@@ -681,7 +692,8 @@ fn split_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
     // Subview index to priority, each a number.
     if let Some(priorities) = builder.archive().field_object(uid, "NSHoldingPriorities") {
         for (index, priority) in builder.archive().dictionary(priorities) {
-            let (Some(index), Some(priority)) = (builder.object_at(index), builder.object_at(priority))
+            let (Some(index), Some(priority)) =
+                (builder.object_at(index), builder.object_at(priority))
             else {
                 continue;
             };
@@ -1621,7 +1633,10 @@ fn view(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Option<Id> {
     }
     // Each is `{horizontal, vertical}`.
     for (key, selector) in [
-        ("NSHuggingPriority", "setContentHuggingPriority:forOrientation:"),
+        (
+            "NSHuggingPriority",
+            "setContentHuggingPriority:forOrientation:",
+        ),
         (
             "NSAntiCompressionPriority",
             "setContentCompressionResistancePriority:forOrientation:",
@@ -1881,9 +1896,18 @@ mod tests {
                         ("NSStackViewEndContainer", Field::Ref(6)),
                     ],
                 ),
-                ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![2, 3]))]),
-                ("NSView", vec![("NSFrame", Field::Text("{{0, 0}, {10, 20}}"))]),
-                ("NSView", vec![("NSFrame", Field::Text("{{0, 0}, {10, 30}}"))]),
+                (
+                    "NSMutableArray",
+                    vec![("NS.objects", Field::Refs(vec![2, 3]))],
+                ),
+                (
+                    "NSView",
+                    vec![("NSFrame", Field::Text("{{0, 0}, {10, 20}}"))],
+                ),
+                (
+                    "NSView",
+                    vec![("NSFrame", Field::Text("{{0, 0}, {10, 30}}"))],
+                ),
                 (
                     "NSStackViewContainer",
                     vec![("NSStackViewContainerNonDroppedViews", Field::Ref(5))],

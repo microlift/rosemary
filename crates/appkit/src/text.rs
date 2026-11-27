@@ -1819,7 +1819,11 @@ mod tests {
         let label = unsafe {
             let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
                 std::mem::transmute(objc::msg::entry());
-            f(text_field(), objc::sel::get("initWithFrame:"), NSRect::default())
+            f(
+                text_field(),
+                objc::sel::get("initWithFrame:"),
+                NSRect::default(),
+            )
         };
         send_view(catcher, "addSubview:", label);
         // SAFETY: the field's own setters, `void (id, SEL, BOOL)`.
@@ -1828,7 +1832,10 @@ mod tests {
             field_set_selectable(label, objc::sel::get("setSelectable:"), 0);
         }
         send_view(label, "mouseDown:", std::ptr::null_mut());
-        assert_eq!(CLICKED.load(std::sync::atomic::Ordering::Relaxed), catcher as usize);
+        assert_eq!(
+            CLICKED.load(std::sync::atomic::Ordering::Relaxed),
+            catcher as usize
+        );
     }
 
     /// The whole point of storing rather than ignoring: what was set is what is

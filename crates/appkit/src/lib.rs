@@ -57,6 +57,8 @@ mod view_controller;
 mod visual_effect;
 mod visual_format;
 pub use chrome::fonts;
+#[cfg(test)]
+mod fixture;
 pub mod geometry;
 pub mod graphics;
 mod icc;
@@ -74,10 +76,8 @@ pub mod monitor;
 pub mod nib;
 pub mod nsevent;
 pub mod opengl;
-pub mod panel;
-#[cfg(test)]
-mod fixture;
 mod outline;
+pub mod panel;
 mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;

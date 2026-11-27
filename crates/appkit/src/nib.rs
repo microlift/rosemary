@@ -161,7 +161,12 @@ fn nib_bytes(nib: Id) -> Vec<u8> {
 }
 
 /// `-[NSNib initWithNibData:bundle:]`.
-unsafe extern "C" fn nib_init_with_data(receiver: Id, _sel: objc::sel::Sel, data: Id, _bundle: Id) -> Id {
+unsafe extern "C" fn nib_init_with_data(
+    receiver: Id,
+    _sel: objc::sel::Sel,
+    data: Id,
+    _bundle: Id,
+) -> Id {
     if receiver.is_null() || data.is_null() {
         return std::ptr::null_mut();
     }
@@ -1136,7 +1141,10 @@ mod tests {
                     "NSIBObjectData",
                     vec![("NSRoot", Field::Ref(1)), ("NSConnections", Field::Ref(2))],
                 ),
-                ("NSCustomObject", vec![("NSClassName", Field::Text("NSView"))]),
+                (
+                    "NSCustomObject",
+                    vec![("NSClassName", Field::Text("NSView"))],
+                ),
                 ("NSMutableArray", vec![("NS.objects", Field::Refs(vec![3]))]),
                 (
                     "NSNibOutletConnector",
@@ -1204,9 +1212,15 @@ mod tests {
             f(constraints, objc::sel::get("objectAtIndex:"), index)
         };
         let inner: Id = send(at(0), "firstItem");
-        assert_eq!(send::<u8>(inner, "translatesAutoresizingMaskIntoConstraints"), 0);
+        assert_eq!(
+            send::<u8>(inner, "translatesAutoresizingMaskIntoConstraints"),
+            0
+        );
         let constants: Vec<f64> = (0..2).map(|i| send(at(i), "constant")).collect();
-        assert!(constants.contains(&42.0) && constants.contains(&20.0), "{constants:?}");
+        assert!(
+            constants.contains(&42.0) && constants.contains(&20.0),
+            "{constants:?}"
+        );
     }
 
     /// A table makes a cell view from the nib registered for its identifier:
@@ -1226,7 +1240,10 @@ mod tests {
                         ("NSObjectsValues", Field::Ref(3)),
                     ],
                 ),
-                ("NSCustomObject", vec![("NSClassName", Field::Text("NSObject"))]),
+                (
+                    "NSCustomObject",
+                    vec![("NSClassName", Field::Text("NSObject"))],
+                ),
                 ("NSArray", vec![("NS.objects", Field::Refs(vec![4]))]),
                 ("NSArray", vec![("NS.objects", Field::Refs(vec![1]))]),
                 (
@@ -1247,7 +1264,12 @@ mod tests {
         let cell = unsafe {
             let register: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
                 std::mem::transmute(objc::msg::entry());
-            register(table, objc::sel::get("registerNib:forIdentifier:"), nib, identifier);
+            register(
+                table,
+                objc::sel::get("registerNib:forIdentifier:"),
+                nib,
+                identifier,
+            );
             let make: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) -> Id =
                 std::mem::transmute(objc::msg::entry());
             make(

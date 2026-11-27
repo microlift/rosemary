@@ -161,7 +161,8 @@ pub(crate) fn is_pane(view: Id) -> bool {
     // SAFETY: a view of this crate's.
     let parent = unsafe { crate::view::superview_of(view) };
     // SAFETY: a live view or nil.
-    crate::view::is_view(parent) && unsafe { corefoundation::base::is_kind_of(parent.cast(), split) }
+    crate::view::is_view(parent)
+        && unsafe { corefoundation::base::is_kind_of(parent.cast(), split) }
 }
 
 /// The property a subview's holding priority is kept under, by its index.
@@ -417,7 +418,10 @@ mod tests {
 
     #[test]
     fn the_pane_holding_lowest_takes_the_change() {
-        assert_eq!(held(&[261.0, 910.0], &[470.0, 250.0], -22.0), [261.0, 888.0]);
+        assert_eq!(
+            held(&[261.0, 910.0], &[470.0, 250.0], -22.0),
+            [261.0, 888.0]
+        );
         assert_eq!(held(&[100.0, 100.0], &[250.0, 250.0], 50.0), [125.0, 125.0]);
         // A pane that cannot shrink further passes the rest on.
         assert_eq!(held(&[100.0, 10.0], &[470.0, 250.0], -30.0), [80.0, 0.0]);
