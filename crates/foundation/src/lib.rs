@@ -62,7 +62,7 @@ pub mod urlsession;
 pub mod value;
 
 mod collections;
-pub use collections::elements_of;
+pub use collections::{elements_of, pairs_of};
 
 use std::sync::Once;
 

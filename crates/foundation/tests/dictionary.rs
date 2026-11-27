@@ -97,6 +97,64 @@ fn array_of(items: &[Id]) -> Id {
     collections::new_array(&items, Policy::from_type_callbacks(), false) as Id
 }
 
+/// The dictionary a `ProxyDictionary` answers for, as a bridge's proxy
+/// answers for its language's mapping.
+static BACKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn backing() -> Id {
+    BACKING.load(std::sync::atomic::Ordering::SeqCst) as Id
+}
+
+unsafe extern "C" fn proxy_count(_: Id, _: Sel) -> usize {
+    count(backing())
+}
+
+unsafe extern "C" fn proxy_object_for_key(_: Id, _: Sel, key: Id) -> Id {
+    unsafe { send1(backing(), "objectForKey:", key) }
+}
+
+unsafe extern "C" fn proxy_key_enumerator(_: Id, _: Sel) -> Id {
+    unsafe { send0(backing(), "keyEnumerator") }
+}
+
+/// An `NSDictionary` subclass with only the primitive methods, which is all
+/// PyObjC's `OC_PythonDictionary` gives.
+fn proxy_dictionary() -> Id {
+    let superclass = objc::class::lookup(c"NSDictionary").expect("Foundation's NSDictionary");
+    let class = corefoundation::base::register(c"ProxyDictionary", Some(superclass), 0, false);
+    class.add_method(
+        objc::sel::get("count"),
+        proxy_count as objc::class::Imp,
+        c"Q16@0:8",
+    );
+    class.add_method(
+        objc::sel::get("objectForKey:"),
+        proxy_object_for_key as objc::class::Imp,
+        c"@24@0:8@16",
+    );
+    class.add_method(
+        objc::sel::get("keyEnumerator"),
+        proxy_key_enumerator as objc::class::Imp,
+        c"@16@0:8",
+    );
+    objc::object::create_instance(class, 0)
+}
+
+fn copies_a_subclass_through_its_primitives() {
+    let source = dictionary(&[("a", 1), ("b", 2)], false);
+    BACKING.store(source as usize, std::sync::atomic::Ordering::SeqCst);
+    let copy = unsafe {
+        class_send1(
+            "NSDictionary",
+            "dictionaryWithDictionary:",
+            proxy_dictionary(),
+        )
+    };
+    assert_eq!(count(copy), 2);
+    assert_eq!(value(copy, "a"), Some(1));
+    assert_eq!(value(copy, "b"), Some(2));
+}
+
 #[test]
 fn dictionaries() {
     foundation::bootstrap();
@@ -106,6 +164,7 @@ fn dictionaries() {
     set_dictionary_replaces_contents();
     removes_objects_for_keys();
     dictionary_with_dictionary_copies_and_respects_receiver();
+    copies_a_subclass_through_its_primitives();
     queries();
     many_keys_build_and_look_up_quickly();
 }

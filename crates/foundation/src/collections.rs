@@ -1532,10 +1532,54 @@ fn entries_of(other: Id, what: &str) -> Option<Vec<(CFTypeRef, CFTypeRef)>> {
     if other.is_null() {
         return None;
     }
-    // SAFETY: a dictionary if it is one of ours.
-    match unsafe { collections::dictionary(other as CFTypeRef) } {
-        Some(d) => Some(d.entries().to_vec()),
+    // SAFETY: a live object, by the caller's guarantee.
+    match unsafe { pairs_of(other) } {
+        Some(pairs) => Some(pairs),
         None => objc::fail!("{what}: the argument is not a dictionary"),
+    }
+}
+
+/// The pairs of an `NSDictionary`: its own storage when it is one of this
+/// runtime's, and otherwise what `-keyEnumerator` and `-objectForKey:` answer -
+/// the primitives every subclass implements, which is how a bridge's proxy for
+/// its language's mappings is read. `None` for anything that is not one.
+///
+/// # Safety
+///
+/// `dictionary` is null or a live object.
+pub unsafe fn pairs_of(dictionary: Id) -> Option<Vec<(CFTypeRef, CFTypeRef)>> {
+    // SAFETY: the caller's guarantee.
+    if let Some(own) = unsafe { collections::dictionary(dictionary as CFTypeRef) } {
+        return Some(own.entries().to_vec());
+    }
+    let class = objc::class::lookup(c"NSDictionary")?;
+    // SAFETY: the caller's guarantee.
+    if dictionary.is_null() || !unsafe { corefoundation::base::is_kind_of(dictionary as _, class) }
+    {
+        return None;
+    }
+    // SAFETY: `-keyEnumerator`, `-nextObject` and `-objectForKey:` are
+    // `id (id, SEL)` and `id (id, SEL, id)` on any dictionary and enumerator.
+    unsafe {
+        let send: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        let lookup: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let keys = send(dictionary, objc::sel::get("keyEnumerator"));
+        let (next, object_for_key) = (
+            objc::sel::get("nextObject"),
+            objc::sel::get("objectForKey:"),
+        );
+        let mut pairs = Vec::new();
+        loop {
+            let key = send(keys, next);
+            if key.is_null() {
+                return Some(pairs);
+            }
+            pairs.push((
+                key as CFTypeRef,
+                lookup(dictionary, object_for_key, key) as CFTypeRef,
+            ));
+        }
     }
 }
 

@@ -45,8 +45,7 @@ fn order(len: usize, options: usize) -> Box<dyn Iterator<Item = usize>> {
 /// receiver is not one of this crate's arrays.
 fn array_snapshot(receiver: Id) -> Option<Snapshot> {
     // SAFETY: the receiver of an NSArray method.
-    let array = unsafe { collections::array(receiver as CFTypeRef) }?;
-    Some(Snapshot::new(array.values.clone()))
+    unsafe { crate::elements_of(receiver) }.map(Snapshot::new)
 }
 
 fn set_snapshot(receiver: Id) -> Option<Snapshot> {
@@ -199,8 +198,7 @@ unsafe extern "C" fn indexes_of_objects_passing_test(receiver: Id, sel: Sel, blo
 
 fn dictionary_snapshot(receiver: Id) -> Option<(Snapshot, Snapshot)> {
     // SAFETY: the receiver of an NSDictionary method.
-    let dictionary = unsafe { collections::dictionary(receiver as CFTypeRef) }?;
-    let (keys, values) = dictionary.entries().iter().copied().unzip();
+    let (keys, values) = unsafe { crate::pairs_of(receiver) }?.into_iter().unzip();
     Some((Snapshot::new(keys), Snapshot::new(values)))
 }
 
@@ -458,4 +456,87 @@ pub(crate) fn install() {
         "enumerateRangesUsingBlock:" => index_set_enumerate_ranges, c"v24@0:8@?16";
         "enumerateRangesWithOptions:usingBlock:" => index_set_enumerate_ranges_with_options, c"v32@0:8Q16@?24";
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static BACKING: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    fn backing() -> Id {
+        BACKING.load(Ordering::SeqCst) as Id
+    }
+
+    unsafe extern "C" fn proxy_count(_: Id, _: Sel) -> usize {
+        // SAFETY: a dictionary of this runtime's.
+        unsafe { collections::dictionary(backing() as CFTypeRef) }.map_or(0, |d| d.entries().len())
+    }
+
+    unsafe extern "C" fn proxy_object_for_key(_: Id, _: Sel, key: Id) -> Id {
+        // SAFETY: `id (id, SEL, id)` on a dictionary.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(backing(), objc::sel::get("objectForKey:"), key)
+        }
+    }
+
+    unsafe extern "C" fn proxy_key_enumerator(_: Id, _: Sel) -> Id {
+        // SAFETY: `id (id, SEL)` on a dictionary.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(backing(), objc::sel::get("keyEnumerator"))
+        }
+    }
+
+    unsafe extern "C" fn count_pair(_: Id, _key: Id, _value: Id, _stop: *mut u8) {
+        SEEN.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A subclass with only the primitives, as PyObjC's proxy for a Python
+    /// `dict` is: enumerating it with a block reads it through them.
+    #[test]
+    fn a_block_enumerates_a_dictionary_subclass() {
+        crate::bootstrap();
+        let pairs: Vec<(CFTypeRef, CFTypeRef)> = ["a", "b", "c"]
+            .iter()
+            .map(|k| {
+                let key = crate::string::from_str(k) as CFTypeRef;
+                (key, key)
+            })
+            .collect();
+        let source = collections::new_dictionary(
+            &pairs,
+            Policy::from_key_callbacks(),
+            Policy::from_type_callbacks(),
+            false,
+        );
+        BACKING.store(source as usize, Ordering::SeqCst);
+        let class = corefoundation::base::register(
+            c"RosemaryEnumeratedProxyDictionary",
+            objc::class::lookup(c"NSDictionary"),
+            0,
+            false,
+        );
+        methods!(class, {
+            "count" => proxy_count, c"Q16@0:8";
+            "objectForKey:" => proxy_object_for_key, c"@24@0:8@16";
+            "keyEnumerator" => proxy_key_enumerator, c"@16@0:8";
+        });
+        let proxy = objc::object::create_instance(class, 0);
+        let block = crate::block::fake::block(count_pair as *const std::ffi::c_void);
+        // SAFETY: `void (id, SEL, void (^)(id, id, BOOL *))`.
+        unsafe {
+            dictionary_enumerate(
+                proxy,
+                objc::sel::get("enumerateKeysAndObjectsUsingBlock:"),
+                block.id(),
+            )
+        };
+        assert_eq!(SEEN.load(Ordering::SeqCst), 3);
+    }
 }
