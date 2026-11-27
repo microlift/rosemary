@@ -1995,7 +1995,7 @@ pub unsafe fn describe(view: Id, depth: usize, out: &mut String) {
     let class = unsafe { objc::object::class_of(view) }.map_or("?", objc::class::Class::name_str);
     let _ = writeln!(
         out,
-        "rosemary: appkit: {:indent$}{class} {view:p} frame {}x{} at ({},{}) mask {:#x}{}",
+        "rosemary: appkit: {:indent$}{class} {view:p} frame {}x{} at ({},{}) mask {:#x}{}{}",
         "",
         v.frame.size.width,
         v.frame.size.height,
@@ -2005,6 +2005,10 @@ pub unsafe fn describe(view: Id, depth: usize, out: &mut String) {
         match v.does_not_autoresize_subviews {
             0 => "",
             _ => " autoresizesSubviews=NO",
+        },
+        match v.hidden {
+            0 => "",
+            _ => " hidden",
         },
         indent = depth * 2,
     );
@@ -3616,8 +3620,9 @@ unsafe extern "C" fn set_needs_display_in_rect(receiver: Id, _sel: Sel, rect: NS
 unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     let was = view_of(receiver).hidden != 0;
     view_of(receiver).hidden = usize::from(hidden != 0);
+    // What was hidden may never have been drawn, below the view as well.
     if was && hidden == 0 {
-        crate::backing::needs_display(receiver);
+        crate::backing::needs_display_in_tree(receiver, 0);
     }
     if was != (hidden != 0) {
         notify_metal_scene(receiver);
