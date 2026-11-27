@@ -640,6 +640,14 @@ struct Parsed {
 /// read. A pattern letter outside those is named and the parse refused, rather
 /// than the field skipped and a different date answered.
 fn parse_pattern(pattern: &str, text: &str) -> Option<Parsed> {
+    parse_pattern_prefix(pattern, text)
+        .filter(|(_, read)| *read == text.chars().count())
+        .map(|(parsed, _)| parsed)
+}
+
+/// [`parse_pattern`] over as much of the start of `text` as the pattern
+/// reads, and how many characters that was.
+fn parse_pattern_prefix(pattern: &str, text: &str) -> Option<(Parsed, usize)> {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     let mut parsed = Parsed::default();
@@ -760,7 +768,7 @@ fn parse_pattern(pattern: &str, text: &str) -> Option<Parsed> {
             }
         }
     }
-    (read == text.len()).then_some(parsed)
+    Some((parsed, read))
 }
 
 /// The Unix timestamp `parsed` names, its wall-clock fields read in
@@ -821,6 +829,10 @@ mod objc_api {
     use objc::sel::Sel;
 
     use super::{CFTypeRef, DateFormat, contents, date_class, make};
+    use crate::geometry::NSRange;
+
+    /// `NSFormattingError`, in `NSCocoaErrorDomain`.
+    const FORMATTING_ERROR: i64 = 2048;
 
     /// # Safety
     ///
@@ -945,6 +957,71 @@ mod objc_api {
             .map_or(std::ptr::null_mut(), crate::timer::date_since_1970)
     }
 
+    /// `-getObjectValue:forString:range:error:`: a date read from the start of
+    /// `range` of `string`, and the range shrunk to what was read.
+    unsafe extern "C" fn get_object_value_for_string_range(
+        receiver: Id,
+        _sel: Sel,
+        object: *mut Id,
+        string: Id,
+        range: *mut NSRange,
+        error: *mut Id,
+    ) -> u8 {
+        // SAFETY: a formatter, and a string or nil.
+        let parsed = match (unsafe { format(receiver) }, string.is_null()) {
+            (Some(format), false) => format
+                .pattern
+                .clone()
+                .map(|pattern| (pattern, format.timezone)),
+            _ => None,
+        };
+        let units: Vec<u16> = String::from_utf8_lossy(&unsafe { crate::string::bytes(string) })
+            .encode_utf16()
+            .collect();
+        // SAFETY: the caller's range, or null for the whole string.
+        let (location, length) = match unsafe { range.as_ref() } {
+            Some(r) => (r.location.min(units.len()), r.length),
+            None => (0, units.len()),
+        };
+        let end = location.saturating_add(length).min(units.len());
+        let text = String::from_utf16_lossy(&units[location..end]);
+        let date = parsed.and_then(|(pattern, timezone)| {
+            let (fields, read) = super::parse_pattern_prefix(&pattern, &text)?;
+            // SAFETY: the zone this formatter retained, or null.
+            let when = unsafe { super::compose(&fields, timezone) }?;
+            let used: usize = text.chars().take(read).map(char::len_utf16).sum();
+            Some((crate::timer::date_since_1970(when), used))
+        });
+        match date {
+            Some((date, used)) => {
+                // SAFETY: the caller's out-pointers, each null or writable.
+                unsafe {
+                    if let Some(out) = object.as_mut() {
+                        *out = date;
+                    }
+                    if let Some(r) = range.as_mut() {
+                        *r = NSRange {
+                            location,
+                            length: used,
+                        };
+                    }
+                }
+                1
+            }
+            None => {
+                // SAFETY: as above.
+                if let Some(out) = unsafe { error.as_mut() } {
+                    *out = crate::error::make(
+                        "NSCocoaErrorDomain",
+                        FORMATTING_ERROR,
+                        "The value is invalid.",
+                    );
+                }
+                0
+            }
+        }
+    }
+
     unsafe extern "C" fn string_from_date(receiver: Id, _sel: Sel, date: Id) -> Id {
         // SAFETY: a formatter.
         let Some(format) = (unsafe { format(receiver) }) else {
@@ -980,6 +1057,8 @@ mod objc_api {
             "calendar" => calendar, c"@16@0:8";
             "stringFromDate:" => string_from_date, c"@24@0:8@16";
             "dateFromString:" => date_from_string, c"@24@0:8@16";
+            "getObjectValue:forString:range:error:" => get_object_value_for_string_range,
+                c"c48@0:8^@16@24^{_NSRange=QQ}32^@40";
         });
         super::calendar_api::install();
     }
@@ -2382,6 +2461,24 @@ mod tests {
         assert_eq!(format.format(3.0, true), "\u{a3}3.00");
         format.style = number_style::CURRENCY_ACCOUNTING;
         assert_eq!(format.format(-3.0, true), "(\u{a3}3.00)");
+    }
+
+    /// CrossOver's ratings: a timestamp read first without its zone, which
+    /// stops short of the end, so the caller retries with one.
+    #[test]
+    fn a_pattern_reads_a_prefix_and_says_how_much() {
+        let text = "2025-03-04T05:06:07+0000";
+        let (parsed, read) =
+            parse_pattern_prefix("yyyy'-'MM'-'dd'T'HH':'mm':'ss", text).expect("a timestamp");
+        assert_eq!(read, 19);
+        assert_eq!(
+            (parsed.year, parsed.month, parsed.day),
+            (Some(2025), Some(3), Some(4))
+        );
+        assert!(parse_pattern("yyyy'-'MM'-'dd'T'HH':'mm':'ss", text).is_none());
+        let (_, read) =
+            parse_pattern_prefix("yyyy'-'MM'-'dd'T'HH':'mm':'ssZZZ", text).expect("with its zone");
+        assert_eq!(read, text.len());
     }
 
     /// The patterns are what a caller parses, so their shape is the interface.
