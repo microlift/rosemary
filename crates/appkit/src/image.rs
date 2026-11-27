@@ -559,7 +559,10 @@ unsafe extern "C" fn image_named(_class: Id, _sel: Sel, name: Id) -> Id {
                 .find_map(|extension| bundle.resource(&name, extension))
         })
     });
-    let Some(bytes) = path.and_then(|path| std::fs::read(path).ok()) else {
+    let bytes = path
+        .and_then(|path| std::fs::read(path).ok())
+        .or_else(|| catalog_image(&name));
+    let Some(bytes) = bytes else {
         return std::ptr::null_mut();
     };
     let class = objc::class::lookup(c"NSImage").expect("declared before its methods");
@@ -577,6 +580,25 @@ unsafe extern "C" fn image_named(_class: Id, _sel: Sel, name: Id) -> Id {
     mark_template_by_name(image, &name);
     named.insert(name, image as usize);
     image
+}
+
+/// The image asset `name` in the main bundle's asset catalog, as the data
+/// of a document `-initWithData:` reads; a refused asset is reported once.
+fn catalog_image(name: &str) -> Option<Vec<u8>> {
+    static REPORTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let bundle = foundation::bundle::main()?;
+    let catalog = crate::catalog::of_bundle(&bundle.root)?;
+    match catalog.image(name, crate::appearance::is_dark())? {
+        Ok(document) => Some(document),
+        Err(why) => {
+            let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+            if !reported.iter().any(|r| r == name) {
+                eprintln!("rosemary: appkit: +[NSImage imageNamed:] {name:?}: {why}");
+                reported.push(name.to_string());
+            }
+            None
+        }
+    }
 }
 
 /// AppKit's convention for `+imageNamed:` and `-[NSBundle imageForResource:]`:

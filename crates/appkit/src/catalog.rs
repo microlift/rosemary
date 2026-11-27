@@ -22,6 +22,20 @@ mod attribute {
 /// `CTSI` layouts.
 const LAYOUT_COLOR: u16 = 1009;
 
+/// A `CTSI` pixel format, as its four bytes are stored.
+const FORMAT_PDF: &[u8; 4] = b" FDP";
+
+/// Payload magics, as stored: raw data, and a compressed bitmap.
+const RAW_DATA: &[u8; 4] = b"DWAR";
+const BITMAP: &[u8; 4] = b"MLEC";
+
+/// Where a `CTSI` header keeps its pixel format and the length of the list of
+/// tagged values that comes between it and the payload.
+const PIXEL_FORMAT_AT: usize = 24;
+const LAYOUT_AT: usize = 36;
+const TLV_LENGTH_AT: usize = 168;
+const HEADER_LENGTH: usize = 184;
+
 pub struct Catalog {
     keyformat: Vec<u32>,
     /// Name to the attribute pairs of its facet.
@@ -217,12 +231,101 @@ impl Catalog {
         let pick = |value: u16| {
             renditions.iter().find(|(key, data)| {
                 appearance.is_none_or(|slot| key.get(slot).copied().unwrap_or(0) == value)
-                    && le16(data, 36) == Some(LAYOUT_COLOR)
+                    && le16(data, LAYOUT_AT) == Some(LAYOUT_COLOR)
             })
         };
         let (_, data) = pick(wanted).or_else(|| pick(0))?;
         color_payload(data)
     }
+}
+
+impl Catalog {
+    /// The image asset `name`, for a dark appearance or not: the PDF of its
+    /// vector rendition, or why there is none this runtime can draw.
+    ///
+    /// FIXME (ACCURACY): only PDF renditions are read; a bitmap's CoreUI
+    /// compression is not decoded, so an asset with bitmaps only is refused.
+    pub fn image(&self, name: &str, dark: bool) -> Option<Result<Vec<u8>, String>> {
+        let renditions = self.renditions_of(name);
+        if renditions.is_empty() {
+            return None;
+        }
+        let appearance = self.slot(attribute::APPEARANCE);
+        let wanted = match dark {
+            true => self.dark_appearance().unwrap_or(0),
+            false => 0,
+        };
+        for value in [wanted, 0] {
+            let pdf = renditions
+                .iter()
+                .filter(|(key, _)| {
+                    appearance.is_none_or(|slot| key.get(slot).copied().unwrap_or(0) == value)
+                })
+                .find_map(|(_, data)| pdf_payload(data));
+            if let Some(pdf) = pdf {
+                return Some(Ok(pdf.to_vec()));
+            }
+        }
+        let why = renditions
+            .iter()
+            .find_map(|(_, data)| bitmap_compression(data))
+            .map_or_else(
+                || String::from("no rendition of a kind this runtime reads"),
+                |codec| format!("only bitmaps compressed with CoreUI's {codec}"),
+            );
+        Some(Err(why))
+    }
+}
+
+/// The payload after a rendition's `CTSI` header and tagged values.
+fn payload(rendition: &[u8]) -> Option<&[u8]> {
+    if rendition.get(..4)? != b"ISTC" {
+        return None;
+    }
+    let tlv = le32(rendition, TLV_LENGTH_AT)? as usize;
+    rendition.get(HEADER_LENGTH + tlv..)
+}
+
+/// The document of a PDF rendition: raw data, after its magic, version and
+/// length.
+fn pdf_payload(rendition: &[u8]) -> Option<&[u8]> {
+    if rendition.get(PIXEL_FORMAT_AT..PIXEL_FORMAT_AT + 4)? != FORMAT_PDF {
+        return None;
+    }
+    let data = payload(rendition)?;
+    if data.get(..4)? != RAW_DATA {
+        return None;
+    }
+    let length = le32(data, 8)? as usize;
+    data.get(12..12 + length)
+}
+
+/// The name of the CoreUI compression a bitmap rendition is stored with.
+fn bitmap_compression(rendition: &[u8]) -> Option<String> {
+    let data = payload(rendition)?;
+    if data.get(..4)? != BITMAP {
+        return None;
+    }
+    const CODECS: [&str; 12] = [
+        "no compression",
+        "RLE",
+        "zip",
+        "LZVN",
+        "LZFSE",
+        "JPEG-LZFSE",
+        "blurred",
+        "ASTC",
+        "palette-img",
+        "HEVC",
+        "deepmap-LZFSE",
+        "deepmap2",
+    ];
+    let codec = le32(data, 8)?;
+    Some(
+        CODECS
+            .get(codec as usize)
+            .map_or_else(|| format!("compression {codec}"), |c| (*c).to_string()),
+    )
 }
 
 /// The components of a `COLR` rendition: `CTSI` header, then the payload.
@@ -283,6 +386,18 @@ mod tests {
 
     /// A store holding one colour asset, laid out as `actool` lays one out.
     fn store(components: &[f64]) -> Vec<u8> {
+        let mut payload = b"RLOC".to_vec();
+        payload.extend(1u32.to_le_bytes());
+        payload.extend(0u32.to_le_bytes());
+        payload.extend((components.len() as u32).to_le_bytes());
+        for c in components {
+            payload.extend(c.to_le_bytes());
+        }
+        store_of(LAYOUT_COLOR, b"\0\0\0\0", &payload)
+    }
+
+    /// A store holding one asset named `Tint` of one rendition.
+    fn store_of(layout: u16, format: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut blocks: Vec<Vec<u8>> = vec![Vec::new()];
         let mut add = |b: Vec<u8>| {
             blocks.push(b);
@@ -303,16 +418,12 @@ mod tests {
         let facet_key = add(b"Tint".to_vec());
 
         let mut rendition = b"ISTC".to_vec();
-        rendition.resize(36, 0);
-        rendition.extend(LAYOUT_COLOR.to_le_bytes());
-        rendition.resize(184, 0);
-        rendition.extend(b"RLOC");
-        rendition.extend(1u32.to_le_bytes());
-        rendition.extend(0u32.to_le_bytes());
-        rendition.extend((components.len() as u32).to_le_bytes());
-        for c in components {
-            rendition.extend(c.to_le_bytes());
-        }
+        rendition.resize(PIXEL_FORMAT_AT, 0);
+        rendition.extend(format);
+        rendition.resize(LAYOUT_AT, 0);
+        rendition.extend(layout.to_le_bytes());
+        rendition.resize(HEADER_LENGTH, 0);
+        rendition.extend(payload);
         let rendition_value = add(rendition);
         let mut key = 0u16.to_le_bytes().to_vec();
         key.extend(42u16.to_le_bytes());
@@ -368,6 +479,33 @@ mod tests {
         out[16..20].copy_from_slice(&be(index));
         out[24..28].copy_from_slice(&be(vars));
         out
+    }
+
+    /// A vector image asset is the PDF its raw-data rendition holds.
+    #[test]
+    fn reads_the_pdf_of_a_vector_image_asset() {
+        const LAYOUT_VECTOR: u16 = 9;
+        let document = b"%PDF-1.3 artwork";
+        let mut raw = RAW_DATA.to_vec();
+        raw.extend(0u32.to_le_bytes());
+        raw.extend((document.len() as u32).to_le_bytes());
+        raw.extend(document);
+        let catalog = Catalog::parse(&store_of(LAYOUT_VECTOR, FORMAT_PDF, &raw)).expect("a store");
+        assert_eq!(catalog.image("Tint", false), Some(Ok(document.to_vec())));
+        assert_eq!(catalog.image("Missing", false), None);
+    }
+
+    /// A bitmap asset whose compression is not decoded is refused, naming it.
+    #[test]
+    fn refuses_a_compressed_bitmap_asset_naming_its_codec() {
+        const LAYOUT_IMAGE: u16 = 12;
+        const DEEPMAP2: u32 = 11;
+        let mut bitmap = BITMAP.to_vec();
+        bitmap.extend(0u32.to_le_bytes());
+        bitmap.extend(DEEPMAP2.to_le_bytes());
+        let catalog = Catalog::parse(&store_of(LAYOUT_IMAGE, b"BGRA", &bitmap)).expect("a store");
+        let refused = catalog.image("Tint", false).expect("an asset").expect_err("refused");
+        assert!(refused.contains("deepmap2"), "{refused}");
     }
 
     #[test]
