@@ -413,6 +413,24 @@ unsafe extern "C" fn init_with_characters(
     }
 }
 
+/// `-initWithCharactersNoCopy:length:freeWhenDone:`, which copies the units
+/// as [`init_with_bytes_no_copy`] copies its bytes.
+unsafe extern "C" fn init_with_characters_no_copy(
+    receiver: Id,
+    sel: Sel,
+    chars: *mut u16,
+    count: usize,
+    free_when_done: u8,
+) -> Id {
+    // SAFETY: the caller says `chars` covers `count` UTF-16 units.
+    let string = unsafe { init_with_characters(receiver, sel, chars, count) };
+    if free_when_done != 0 && !chars.is_null() && !string.is_null() {
+        // SAFETY: the caller gave this buffer, from `malloc`, to the string.
+        unsafe { objc::allocator::guest_free(chars.cast()) };
+    }
+    string
+}
+
 unsafe extern "C" fn string_with_cstring_encoding(
     _class: Id,
     _sel: Sel,
@@ -2021,6 +2039,8 @@ pub(crate) fn install() {
         // other initializer here does, and what the immutable storage allows:
         // `corefoundation::string` lays a string out at creation.
         "initWithCharacters:length:" => init_with_characters, c"@32@0:8^S16Q24";
+        "initWithCharactersNoCopy:length:freeWhenDone:" => init_with_characters_no_copy,
+            c"@36@0:8^S16Q24c32";
     });
 }
 

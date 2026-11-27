@@ -79,3 +79,23 @@ fn init_with_characters_returns_an_owned_string() {
     });
     assert_eq!(owned, 1);
 }
+
+#[test]
+fn init_with_characters_no_copy_reads_the_units() {
+    foundation::bootstrap();
+    let mut characters: Vec<u16> = "caf\u{e9}".encode_utf16().collect();
+    let receiver = alloc_string();
+    let (sel, imp) = implementation(receiver, "initWithCharactersNoCopy:length:freeWhenDone:");
+    // SAFETY: `-initWithCharactersNoCopy:length:freeWhenDone:` is
+    // `id (id, SEL, unichar *, NSUInteger, BOOL)`.
+    let string = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, *mut u16, usize, u8) -> Id = std::mem::transmute(imp);
+        f(receiver, sel, characters.as_mut_ptr(), characters.len(), 0)
+    };
+    // SAFETY: an `NSString`.
+    assert_eq!(
+        unsafe { foundation::string::bytes(string) },
+        "caf\u{e9}".as_bytes()
+    );
+    objc::arc::release(string);
+}
