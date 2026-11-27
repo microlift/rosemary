@@ -346,11 +346,11 @@ impl PngHeader {
     }
 }
 
-/// An eight-bit non-interlaced PNG.
+/// A non-interlaced PNG of any bit depth, each sample scaled to eight bits as
+/// drawing into an eight-bit context does.
 ///
-/// Sixteen-bit samples and Adam7 are declined rather than approximated: half of
-/// a sixteen-bit sample is a visibly different image, and an interlaced file
-/// read as if it were not is seven overlapping thumbnails.
+/// Adam7 is declined rather than approximated: an interlaced file read as if
+/// it were not is seven overlapping thumbnails.
 fn png(bytes: &[u8]) -> Option<Bitmap> {
     let mut header = None;
     let mut palette: &[u8] = &[];
@@ -385,13 +385,22 @@ fn png(bytes: &[u8]) -> Option<Bitmap> {
     }
 
     let header = header?;
-    if header.depth != 8 || header.interlace != 0 || header.width == 0 || header.height == 0 {
+    let depth = header.depth as usize;
+    let depth_allowed = match header.colour {
+        0 => matches!(depth, 1 | 2 | 4 | 8 | 16),
+        3 => matches!(depth, 1 | 2 | 4 | 8),
+        _ => matches!(depth, 8 | 16),
+    };
+    if !depth_allowed || header.interlace != 0 || header.width == 0 || header.height == 0 {
         return None;
     }
     let channels = header.channels()?;
     let width = header.width as usize;
     let height = header.height as usize;
-    let stride = width.checked_mul(channels)?;
+    let stride = width.checked_mul(channels * depth)?.div_ceil(8);
+    // The filters predict from the previous whole pixel, or the previous
+    // byte when a pixel is smaller than one.
+    let filter_unit = (channels * depth / 8).max(1);
 
     // Every row is one filter byte followed by its samples, so the inflated
     // size is known exactly - which is what lets this use the one-shot
@@ -412,28 +421,77 @@ fn png(bytes: &[u8]) -> Option<Bitmap> {
         return None;
     }
 
+    // A sample as stored, and as eight bits.
+    let max = (1u32 << depth) - 1;
+    let sample_at = |row: &[u8], index: usize| -> u32 {
+        match depth {
+            16 => u16::from_be_bytes([row[index * 2], row[index * 2 + 1]]) as u32,
+            8 => row[index] as u32,
+            _ => {
+                let bit = index * depth;
+                (row[bit / 8] as u32 >> (8 - depth - bit % 8)) & max
+            }
+        }
+    };
+    let scale = |value: u32| ((value * 255 + max / 2) / max) as u8;
+    // `tRNS` for grey and RGB is one colour, at the image's own depth, that
+    // is fully transparent.
+    let transparent: Vec<u32> = match header.colour {
+        0 | 2 => transparency
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair) as u32)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     let mut out = Bitmap::new(header.width, header.height);
     let mut previous = vec![0u8; stride];
     let mut row = vec![0u8; stride];
+    let mut samples = vec![0u32; channels];
     for y in 0..height {
         let start = y * (stride + 1);
         let filter = raw[start];
         row.copy_from_slice(&raw[start + 1..start + 1 + stride]);
-        unfilter(filter, &mut row, &previous, channels)?;
+        unfilter(filter, &mut row, &previous, filter_unit)?;
         let destination = y * out.bytes_per_row();
         for x in 0..width {
-            let sample = &row[x * channels..];
+            for (channel, sample) in samples.iter_mut().enumerate() {
+                *sample = sample_at(&row, x * channels + channel);
+            }
+            let keyed = !transparent.is_empty() && samples[..] == transparent[..channels];
+            let opaque = match keyed {
+                true => 0,
+                false => 0xff,
+            };
             let rgba = match header.colour {
-                0 => [sample[0], sample[0], sample[0], 0xff],
-                2 => [sample[0], sample[1], sample[2], 0xff],
+                0 => {
+                    let grey = scale(samples[0]);
+                    [grey, grey, grey, opaque]
+                }
+                2 => [
+                    scale(samples[0]),
+                    scale(samples[1]),
+                    scale(samples[2]),
+                    opaque,
+                ],
                 3 => {
-                    let index = sample[0] as usize;
+                    let index = samples[0] as usize;
                     let entry = palette.get(index * 3..index * 3 + 3)?;
                     let alpha = transparency.get(index).copied().unwrap_or(0xff);
                     [entry[0], entry[1], entry[2], alpha]
                 }
-                4 => [sample[0], sample[0], sample[0], sample[1]],
-                _ => [sample[0], sample[1], sample[2], sample[3]],
+                4 => {
+                    let grey = scale(samples[0]);
+                    [grey, grey, grey, scale(samples[1])]
+                }
+                _ => [
+                    scale(samples[0]),
+                    scale(samples[1]),
+                    scale(samples[2]),
+                    scale(samples[3]),
+                ],
             };
             out.pixels[destination + x * 4..destination + x * 4 + 4].copy_from_slice(&rgba);
         }
@@ -447,15 +505,15 @@ fn png(bytes: &[u8]) -> Option<Bitmap> {
 /// The filters predict from the byte to the left, the byte above and the byte
 /// diagonally above-left; outside the image each of those reads as zero, which
 /// is what the first row and the first pixel of every row rely on.
-fn unfilter(filter: u8, row: &mut [u8], previous: &[u8], channels: usize) -> Option<()> {
+fn unfilter(filter: u8, row: &mut [u8], previous: &[u8], unit: usize) -> Option<()> {
     for i in 0..row.len() {
-        let left = match i >= channels {
-            true => row[i - channels] as i32,
+        let left = match i >= unit {
+            true => row[i - unit] as i32,
             false => 0,
         };
         let above = previous.get(i).copied().unwrap_or(0) as i32;
-        let diagonal = match i >= channels {
-            true => previous.get(i - channels).copied().unwrap_or(0) as i32,
+        let diagonal = match i >= unit {
+            true => previous.get(i - unit).copied().unwrap_or(0) as i32,
             false => 0,
         };
         let predicted = match filter {
@@ -792,15 +850,35 @@ mod tests {
         assert_eq!(&decoded.pixels[..], &[1, 2, 3, 0xff]);
     }
 
-    /// Sixteen-bit samples would have to be halved and Adam7 reassembled, so
-    /// both are declined - a decoder that ignored either would answer with a
-    /// plausible wrong image.
+    /// Sixteen-bit samples are rounded to eight bits, as drawing them into
+    /// an eight-bit context does.
     #[test]
-    fn a_png_this_decoder_cannot_read_is_declined() {
-        let mut deep = png_file(1, 1, 6, &[0; 9]);
-        deep[24] = 16;
-        assert_eq!(decode(&deep), None);
+    fn a_sixteen_bit_png_is_rounded_to_eight_bits() {
+        let mut file = png_file(
+            1,
+            1,
+            6,
+            &[0, 0xff, 0xff, 0x80, 0x80, 0x00, 0x7f, 0x12, 0x34],
+        );
+        file[24] = 16;
+        let decoded = decode(&file).expect("a sixteen-bit RGBA PNG");
+        assert_eq!(&decoded.pixels[..], &[0xff, 0x80, 0x00, 0x12]);
+    }
 
+    /// Below eight bits, samples are packed several to a byte, high bits first.
+    #[test]
+    fn a_two_bit_grey_png_unpacks_its_samples() {
+        let mut file = png_file(4, 1, 0, &[0, 0b00_01_10_11]);
+        file[24] = 2;
+        let decoded = decode(&file).expect("a two-bit grey PNG");
+        let greys: Vec<u8> = decoded.pixels.chunks(4).map(|p| p[0]).collect();
+        assert_eq!(greys, [0x00, 0x55, 0xaa, 0xff]);
+    }
+
+    /// Adam7 would have to be reassembled, so it is declined - a decoder that
+    /// ignored it would answer with a plausible wrong image.
+    #[test]
+    fn an_interlaced_png_is_declined() {
         let mut interlaced = png_file(1, 1, 6, &[0; 5]);
         interlaced[28] = 1;
         assert_eq!(decode(&interlaced), None);
