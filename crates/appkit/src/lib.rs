@@ -61,6 +61,7 @@ pub use chrome::fonts;
 mod fixture;
 pub mod geometry;
 pub mod graphics;
+mod html;
 mod icc;
 pub mod icon;
 pub mod image;
@@ -167,6 +168,7 @@ pub fn bootstrap() {
         coreanimation::install();
         transaction::install();
         text::install();
+        html::install();
         label::install();
         // Last of the controls (text fields and labels included): a cell
         // forwards what its control implements.
