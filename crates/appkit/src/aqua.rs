@@ -634,12 +634,38 @@ pub(crate) fn text_field_fill(p: &Painter, r: NSRect) {
     p.rect(r, p.palette.field_fill);
 }
 
-/// A round (search) field's frame: a capsule outline.
-pub(crate) fn round_field(p: &Painter, r: NSRect, focused: bool) {
-    let radius = r.size.height / 2.0;
-    p.stroke_rounded(r, radius, 1.0, p.palette.field_side);
+/// The corner radius of a search field's bezel.
+const SEARCH_FIELD_RADIUS: f64 = 6.0;
+/// A search field's magnifying glass: the lens's radius, and its centre's
+/// distance from the field's leading edge.
+const SEARCH_GLASS_RADIUS: f64 = 4.5;
+const SEARCH_GLASS_CENTER: f64 = 10.5;
+
+/// A search field's bezel: a filled rounded rectangle with a magnifying glass
+/// at its leading end.
+pub(crate) fn search_field(p: &Painter, r: NSRect, focused: bool) {
+    p.fill_rounded(r, SEARCH_FIELD_RADIUS, p.palette.field_fill);
+    p.stroke_rounded(r, SEARCH_FIELD_RADIUS, 1.0, p.palette.field_side);
+    let (cx, cy) = (
+        r.origin.x + SEARCH_GLASS_CENTER,
+        r.origin.y + r.size.height / 2.0 - 1.0,
+    );
+    p.ellipse(rect(
+        cx - SEARCH_GLASS_RADIUS,
+        cy - SEARCH_GLASS_RADIUS,
+        2.0 * SEARCH_GLASS_RADIUS,
+        2.0 * SEARCH_GLASS_RADIUS,
+    ));
+    p.stroke(1.25, p.palette.mark_secondary);
+    // The handle runs down and away from the lens at 45 degrees.
+    let edge = SEARCH_GLASS_RADIUS * std::f64::consts::FRAC_1_SQRT_2;
+    p.polyline(
+        &[(cx + edge, cy + edge), (cx + edge + 3.0, cy + edge + 3.0)],
+        false,
+    );
+    p.stroke(1.5, p.palette.mark_secondary);
     if focused {
-        p.focus_ring_rounded(r, radius);
+        p.focus_ring_rounded(r, SEARCH_FIELD_RADIUS);
     }
 }
 

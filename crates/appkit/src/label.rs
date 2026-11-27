@@ -67,6 +67,13 @@ const TRUNCATE_TAIL: isize = 4;
 /// The room `NSTextFieldCell` leaves either side of its text.
 const PADDING: f64 = 2.0;
 
+/// Where a search field's text starts, past its magnifying glass.
+const SEARCH_TEXT_LEADING: f64 = 22.0;
+/// A regular-size search field's height.
+///
+/// FIXME (ACCURACY): the small and mini control sizes are as tall.
+const SEARCH_FIELD_HEIGHT: f64 = 22.0;
+
 /// AppKit's system font size, for a field given no font.
 const SYSTEM_SIZE: f64 = 13.0;
 
@@ -161,6 +168,39 @@ fn is_text_field(object: Id) -> bool {
     })
 }
 
+fn is_search_field(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { objc::object::class_of(object) }.is_some_and(|c| {
+        objc::class::lookup(c"NSSearchField").is_some_and(|k| c.chain().any(|x| std::ptr::eq(x, k)))
+    })
+}
+
+/// The room left of a field's text, and right of it.
+fn text_insets(receiver: Id) -> (f64, f64) {
+    match is_search_field(receiver) {
+        true => (SEARCH_TEXT_LEADING, PADDING),
+        false => (PADDING, PADDING),
+    }
+}
+
+/// What an empty field shows instead of its text: the placeholder it was
+/// given, or a search field's "Search".
+fn placeholder(receiver: Id) -> Option<String> {
+    let given = crate::props::object(receiver, "placeholderString");
+    if !given.is_null() {
+        // SAFETY: a string the guest set.
+        return Some(
+            String::from_utf8_lossy(&unsafe { foundation::string::bytes(given) }).into_owned(),
+        );
+    }
+    let attributed = crate::props::object(receiver, "placeholderAttributedString");
+    // SAFETY: an attributed string the guest set, or nil.
+    if let Some((text, _)) = unsafe { foundation::attributed_string::parts(attributed) } {
+        return Some(text);
+    }
+    is_search_field(receiver).then(|| "Search".to_string())
+}
+
 /// The size a field's text needs, which is what AppKit's
 /// `-intrinsicContentSize` says and what a stack sizes a label to.
 pub(crate) fn intrinsic_size(receiver: Id) -> Option<NSSize> {
@@ -171,9 +211,14 @@ pub(crate) fn intrinsic_size(receiver: Id) -> Option<NSSize> {
     let (font, size) = font_of(&look)?;
     let text = crate::text::field_text(receiver);
     let (ascent, descent) = font.metrics(size as f32);
+    let (lead, trail) = text_insets(receiver);
+    let height = f64::from(ascent + descent).ceil();
     Some(NSSize {
-        width: (f64::from(font.measure(&text, size as f32)) + 2.0 * PADDING).ceil(),
-        height: f64::from(ascent + descent).ceil(),
+        width: (f64::from(font.measure(&text, size as f32)) + lead + trail).ceil(),
+        height: match is_search_field(receiver) {
+            true => height.max(SEARCH_FIELD_HEIGHT),
+            false => height,
+        },
     })
 }
 
@@ -310,11 +355,18 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
     let (w, h) = (bounds.size.width as f32, bounds.size.height as f32);
-    if look.draws_background && look.background != 0 {
+    let search = is_search_field(receiver);
+    if search
+        && let Some((port, flipped)) = crate::cell::current_port()
+        && let Some(painter) = crate::aqua::Painter::new(port, bounds, flipped)
+    {
+        crate::aqua::search_field(&painter, bounds, false);
+    }
+    if look.draws_background && look.background != 0 && !search {
         let fill = color_of(look.background, chrome::Color::rgba(0, 0, 0, 0.0));
         canvas.fill_rect(chrome::Rect::new(0.0, 0.0, w, h), fill);
     }
-    if look.bordered {
+    if look.bordered && !search {
         let edge = chrome::Color::rgba(0, 0, 0, 0.25);
         canvas.stroke_rounded_rect(
             chrome::Rect::new(0.5, 0.5, w - 1.0, h - 1.0),
@@ -324,16 +376,26 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
         );
     }
     let text = crate::text::field_text(receiver);
+    let color = color_of(look.text_color, chrome::Color::rgba(0, 0, 0, 0.85));
+    let (text, color) = match (text.is_empty(), placeholder(receiver)) {
+        (true, Some(placeholder)) => {
+            let faint = crate::color::named_color("placeholderTextColor")
+                .map_or(color, |c| color_of(c as usize, color));
+            (placeholder, faint)
+        }
+        _ => (text, color),
+    };
     if let Some((font, size)) = font_of(&look)
         && !text.is_empty()
     {
         let size = size as f32;
-        let room = (w - 2.0 * PADDING as f32).max(0.0);
-        let color = color_of(look.text_color, chrome::Color::rgba(0, 0, 0, 0.85));
+        let (lead, trail) = text_insets(receiver);
+        let (lead, trail) = (lead as f32, trail as f32);
+        let room = (w - lead - trail).max(0.0);
         let x_for = |advance: f32| match look.alignment {
-            RIGHT => w - PADDING as f32 - advance,
+            RIGHT => w - trail - advance,
             CENTER => (w - advance) / 2.0,
-            _ => PADDING as f32,
+            _ => lead,
         };
         match look.wraps() {
             // A wrapping field sets its lines from the top, as a Mac's does.
@@ -475,6 +537,17 @@ unsafe extern "C" fn alignment(receiver: Id, _sel: Sel) -> isize {
     look(receiver).alignment
 }
 
+unsafe extern "C" fn set_placeholder_string(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: the `copy` property's setter.
+    unsafe { crate::props::set_copied(receiver, sel, value) };
+    crate::backing::needs_display(receiver);
+}
+
+unsafe extern "C" fn set_placeholder_attributed_string(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: as above.
+    unsafe { set_placeholder_string(receiver, sel, value) };
+}
+
 pub(crate) fn install() {
     let field = objc::class::lookup(c"NSTextField").expect("declared before its methods");
     methods!(field, {
@@ -491,6 +564,10 @@ pub(crate) fn install() {
         // FIXME (ACCURACY): kept, and not drawn: a field here draws its border
         // the same way bezeled or not.
         "isBezeled" => crate::props::get_bool, c"c16@0:8";
+        "placeholderString" => crate::props::get_object, c"@16@0:8";
+        "setPlaceholderString:" => set_placeholder_string, c"v24@0:8@16";
+        "placeholderAttributedString" => crate::props::get_object, c"@16@0:8";
+        "setPlaceholderAttributedString:" => set_placeholder_attributed_string, c"v24@0:8@16";
         "setBezeled:" => crate::props::set_bool, c"v20@0:8c16";
         "bezelStyle" => crate::props::get_integer, c"q16@0:8";
         "setBezelStyle:" => crate::props::set_integer, c"v24@0:8q16";
@@ -533,6 +610,23 @@ mod tests {
         assert_eq!(sized.height, empty.height);
         assert_eq!(look(label).alignment, CENTER);
         forget(label);
+    }
+
+    #[test]
+    fn a_search_field_is_a_control_tall_and_says_search_until_given_a_placeholder() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSSearchField").expect("NSSearchField");
+        let field = objc::object::create_instance(class, 0);
+        let size = intrinsic_size(field).expect("a search field has a size");
+        assert_eq!(size.height, SEARCH_FIELD_HEIGHT);
+        assert!(size.width >= SEARCH_TEXT_LEADING + PADDING);
+        assert_eq!(placeholder(field).as_deref(), Some("Search"));
+        let given = foundation::string::from_str("Find an application");
+        // SAFETY: the setter's own prototype.
+        unsafe { set_placeholder_string(field, objc::sel::get("setPlaceholderString:"), given) };
+        objc::arc::release(given);
+        assert_eq!(placeholder(field).as_deref(), Some("Find an application"));
+        forget(field);
     }
 
     fn send_f64(receiver: Id, sel: &str) -> f64 {

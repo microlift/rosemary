@@ -905,7 +905,7 @@ fn paint(
         }
         Drawn::Popup { pulls_down } => aqua::popup_button(&p, frame, size, look, pulls_down),
         Drawn::Combo => aqua::combo_box(&p, frame, size, look),
-        Drawn::Search => aqua::round_field(&p, frame, look.focused),
+        Drawn::Search => aqua::search_field(&p, frame, look.focused),
         Drawn::Field => {
             aqua::text_field_fill(&p, frame);
             aqua::text_field(&p, frame, look.focused)

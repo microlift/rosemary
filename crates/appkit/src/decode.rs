@@ -1363,11 +1363,16 @@ fn text_field(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
     let Some(cell) = cell else {
         return Some(view);
     };
-    if let Some(contents) = text(builder, cell, "NSContents") {
-        let value = foundation::string::from_str(contents);
-        // SAFETY: `-setStringValue:` takes one string.
-        unsafe { send_object(view, "setStringValue:", value) };
-        objc::arc::release(value);
+    for (key, selector) in [
+        ("NSContents", "setStringValue:"),
+        ("NSPlaceholderString", "setPlaceholderString:"),
+    ] {
+        if let Some(contents) = text(builder, cell, key) {
+            let value = foundation::string::from_str(contents);
+            // SAFETY: both setters take one string.
+            unsafe { send_object(view, selector, value) };
+            objc::arc::release(value);
+        }
     }
     for (key, selector) in [
         ("NSTextColor", "setTextColor:"),
