@@ -2473,12 +2473,22 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
         };
     }
     // SAFETY: validated above.
-    unsafe { hit_base(view, point, depth) }
+    unsafe { hit_from(view, point, depth) }
+}
+
+/// `-[NSView hitTest:]` itself, for a subclass's override to start from.
+///
+/// # Safety
+///
+/// `view` must be a view of this crate's, and `point` in its superview's
+/// coordinates.
+pub(crate) unsafe fn hit_base(view: Id, point: NSPoint) -> Id {
+    unsafe { hit_from(view, point, 0) }
 }
 
 /// The inherited `NSView` hit-test behavior, without redispatching an override
 /// on `view`. This distinction matters when that override calls `super`.
-unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
+unsafe fn hit_from(view: Id, point: NSPoint, depth: usize) -> Id {
     if view_of(view).hidden != 0 {
         return std::ptr::null_mut();
     }
@@ -2511,7 +2521,7 @@ unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
 unsafe extern "C" fn hit_test_method(receiver: Id, _sel: Sel, point: NSPoint) -> Id {
     // SAFETY: the receiver is a live view and the point is in its superview's
     // coordinates, as expected by this module's tree walk.
-    unsafe { hit_base(receiver, point, 0) }
+    unsafe { hit_from(receiver, point, 0) }
 }
 
 /// Send `-updateTrackingAreas` down a view tree.
