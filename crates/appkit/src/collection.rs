@@ -962,12 +962,18 @@ unsafe extern "C" fn selection_index_paths(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
-/// `-setSelectionIndexPaths:`, which tells each item whether it is selected.
-unsafe extern "C" fn set_selection_index_paths(receiver: Id, sel: Sel, paths: Id) {
-    // SAFETY: the `copy` property setter.
-    unsafe { props::set_copied(receiver, sel, paths) };
+/// `-setSelectionIndexPaths:`, the one programmatic change of selection its
+/// observers are told of.
+unsafe extern "C" fn set_selection_index_paths(receiver: Id, _sel: Sel, paths: Id) {
+    store_selection(receiver, paths);
+}
+
+/// Keep `paths` as the selection and tell each item whether it is selected.
+fn store_selection(view: Id, paths: Id) {
+    // SAFETY: the `copy` property setter's storage.
+    unsafe { props::set_copied(view, objc::sel::get("setSelectionIndexPaths:"), paths) };
     let selected: HashSet<Path> = paths_in(paths).into_iter().collect();
-    let items = items(receiver);
+    let items = items(view);
     for key in elements(send_id(items, "allKeys")) {
         let item = send_id_id(items, "objectForKey:", key);
         let wanted = path_of(key).is_some_and(|p| selected.contains(&p));
@@ -975,13 +981,21 @@ unsafe extern "C" fn set_selection_index_paths(receiver: Id, sel: Sel, paths: Id
             send_set_bool(item, "setSelected:", wanted);
         }
     }
-    crate::backing::needs_display(receiver);
+    crate::backing::needs_display(view);
 }
 
 /// Change the selection through `-setSelectionIndexPaths:`, so its
-/// observers are told.
+/// observers are told, as a user's click and `-selectAll:` do.
 fn select(view: Id, paths: &[Path]) {
     send_id_id(view, "setSelectionIndexPaths:", set_of_paths(paths));
+}
+
+/// Change the selection without telling its observers: AppKit's
+/// `-selectItemsAtIndexPaths:scrollPosition:`, `-deselectItemsAtIndexPaths:`
+/// and `-deselectAll:` send no change notification for `selectionIndexPaths`,
+/// and programs that observe it (CrossOver) count on that.
+fn select_quietly(view: Id, paths: &[Path]) {
+    store_selection(view, set_of_paths(paths));
 }
 
 unsafe extern "C" fn select_items(receiver: Id, _sel: Sel, paths: Id, _position: usize) {
@@ -992,18 +1006,18 @@ unsafe extern "C" fn select_items(receiver: Id, _sel: Sel, paths: Id, _position:
     selection.extend(paths_in(paths));
     selection.sort_unstable();
     selection.dedup();
-    select(receiver, &selection);
+    select_quietly(receiver, &selection);
 }
 
 unsafe extern "C" fn deselect_items(receiver: Id, _sel: Sel, paths: Id) {
     let gone = paths_in(paths);
     let mut selection = paths_in(selection_of(receiver));
     selection.retain(|p| !gone.contains(p));
-    select(receiver, &selection);
+    select_quietly(receiver, &selection);
 }
 
 unsafe extern "C" fn deselect_all(receiver: Id, _sel: Sel, _sender: Id) {
-    select(receiver, &[]);
+    select_quietly(receiver, &[]);
 }
 
 unsafe extern "C" fn select_all(receiver: Id, _sel: Sel, _sender: Id) {
@@ -1344,4 +1358,66 @@ pub(crate) fn install() {
     properties!(item, {
         bool "isSelected", "setSelected:";
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NOTIFIED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_change(_: Id, _: Sel, _: Id, _: Id, _: Id, _: *mut c_void) {
+        NOTIFIED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn observed_view() -> Id {
+        crate::bootstrap();
+        let observer_class =
+            corefoundation::base::register(c"RosemarySelectionObserver", None, 0, false);
+        methods!(observer_class, {
+            "observeValueForKeyPath:ofObject:change:context:" => count_change, c"v48@0:8@16@24@32^v40";
+        });
+        let observer = objc::object::create_instance(observer_class, 0);
+        let view = send_id(send_id(class_named(c"NSCollectionView"), "alloc"), "init");
+        // SAFETY: `-addObserver:forKeyPath:options:context:` is
+        // `void (id, SEL, id, NSString *, NSUInteger, void *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, usize, *mut c_void) =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                view,
+                objc::sel::get("addObserver:forKeyPath:options:context:"),
+                observer,
+                foundation::string::from_str("selectionIndexPaths"),
+                0,
+                std::ptr::null_mut(),
+            );
+        }
+        view
+    }
+
+    #[test]
+    fn only_setting_the_selection_notifies_its_observers() {
+        let view = observed_view();
+        let first = set_of_paths(&[(0, 0)]);
+        // SAFETY: `-selectItemsAtIndexPaths:scrollPosition:` is
+        // `void (id, SEL, NSSet *, NSCollectionViewScrollPosition)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, usize) =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                view,
+                objc::sel::get("selectItemsAtIndexPaths:scrollPosition:"),
+                first,
+                0,
+            );
+        }
+        assert_eq!(paths_in(selection_of(view)), [(0, 0)]);
+        send_id_id(view, "deselectItemsAtIndexPaths:", first);
+        send_id_id(view, "deselectAll:", std::ptr::null_mut());
+        assert_eq!(NOTIFIED.load(Ordering::SeqCst), 0);
+        send_id_id(view, "setSelectionIndexPaths:", first);
+        assert_eq!(NOTIFIED.load(Ordering::SeqCst), 1);
+    }
 }
