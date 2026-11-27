@@ -208,3 +208,59 @@ fn locally_built_binary_maps_and_protects() {
     mem.read(mapped.base, &mut magic).unwrap();
     assert_eq!(u32::from_le_bytes(magic), MH_MAGIC_64);
 }
+
+/// Laid out as Wine's loader is: the header at `0x2_0000_0000`, with zero-fill
+/// segments far below and far above it.
+const SPLIT_SOURCE: &str = r#"
+__asm__(".zerofill LOW,LOW,_low,0x1000\n.zerofill FAR,FAR,_far,0x10000");
+int main(void) { return 0; }
+"#;
+
+fn split_executable() -> Option<Vec<u8>> {
+    common::build_x86_64(
+        "split_segments",
+        SPLIT_SOURCE,
+        &[
+            "-Wl,-pagezero_size,0x1000",
+            "-Wl,-image_base,0x200000000",
+            "-Wl,-segaddr,LOW,0x10000",
+            "-Wl,-segaddr,FAR,0x700000000000",
+            "-Wl,-no_pie",
+        ],
+    )
+}
+
+#[test]
+fn preferred_base_is_the_header_not_the_lowest_segment() {
+    let Some(bytes) = split_executable() else {
+        skip!("no x86_64 toolchain")
+    };
+    let obj = MachObject::parse_any(&bytes, X86_64).unwrap();
+    assert_eq!(obj.preferred_base().unwrap(), 0x2_0000_0000);
+}
+
+#[test]
+fn maps_segments_far_apart_without_reserving_the_gaps() {
+    let Some(bytes) = split_executable() else {
+        skip!("no x86_64 toolchain")
+    };
+    let obj = MachObject::parse_any(&bytes, X86_64).unwrap();
+    let mut mem = BufferSpace::new(0);
+    let mapped = map_segments(&obj, &mut mem).unwrap();
+
+    assert_eq!((mapped.base, mapped.slide), (0x2_0000_0000, 0));
+    assert!(
+        (mapped.span as u64) < 0x100_0000,
+        "span {:#x} covers the gaps between segments",
+        mapped.span
+    );
+    let mut magic = [0u8; 4];
+    mem.read(mapped.base, &mut magic).unwrap();
+    assert_eq!(u32::from_le_bytes(magic), MH_MAGIC_64);
+    for addr in [0x1_0000, 0x7000_0000_0000] {
+        let mut zero = [0xffu8; 8];
+        mem.read(addr, &mut zero).unwrap();
+        assert_eq!(zero, [0; 8], "zero-fill segment at {addr:#x}");
+    }
+    assert!(mem.read(0x1_0000_0000, &mut [0u8; 1]).is_err());
+}

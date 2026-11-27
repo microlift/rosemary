@@ -234,13 +234,18 @@ impl<'a, S: MachSpec> MachObject<'a, S> {
         self.segments.iter().filter(|s| s.is_mappable())
     }
 
-    /// The image's preferred load address: the `vmaddr` of the first mappable
-    /// segment. For a typical x86-64 executable this is `0x1_0000_0000`, the
-    /// address just past `__PAGEZERO`.
+    /// The image's preferred load address: where its Mach header lands, the
+    /// `vmaddr` of the segment mapping file offset zero. For a typical x86-64
+    /// executable this is `0x1_0000_0000`, the address just past `__PAGEZERO`.
+    ///
+    /// Not simply the lowest segment: dyld measures export, function-start and
+    /// unwind offsets from the header, and an image may place a zero-fill
+    /// segment below it (Wine's loader reserves `[0x1000, 0x2_0000_0000)`).
     pub fn preferred_base(&self) -> Result<Word> {
         self.mappable_segments()
+            .find(|s| s.fileoff == 0 && s.filesize > 0)
+            .or_else(|| self.mappable_segments().min_by_key(|s| s.vmaddr))
             .map(|s| s.vmaddr)
-            .min()
             .ok_or(Error::NoLoadableSegments)
     }
 

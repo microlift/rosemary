@@ -114,7 +114,7 @@ pub struct MappedImage {
     /// Zero when the image landed on its preferred base, which is the
     /// case the recompiler's identity mapping wants.
     pub slide: Word,
-    /// Total reserved span in bytes.
+    /// Total bytes reserved, across every run of contiguous segments.
     pub span: usize,
     /// Absolute entry point, if the image declares one.
     pub entry: Option<Word>,
@@ -171,24 +171,37 @@ pub fn map_segments_from<S: MachSpec, M: AddressSpace>(
     // Silicon protects at 16 KiB, so the protection sweep rounds segment ends
     // up to 16 KiB - and would then run past a reservation sized only to 4 KiB.
     let gran = page.max(mem.protect_granularity()).max(1);
-    let end = obj
-        .mappable_segments()
-        .map(|s| align_up(s.vmend(), gran))
-        .max()
-        .ok_or(Error::NoLoadableSegments)?;
-    let span_w = end
-        .checked_sub(preferred)
-        .ok_or(Error::Memory("negative span"))?;
-    let span = usize::try_from(span_w).map_err(|_| Error::Memory("span too large"))?;
+    let runs = reservation_runs(obj, gran);
+    if runs.is_empty() {
+        return Err(Error::NoLoadableSegments);
+    }
 
-    let placement = if obj.is_pie() {
-        Placement::Preferred(preferred)
-    } else {
-        Placement::Fixed(preferred)
-    };
-
-    let base = mem.reserve(span, page as usize, placement)?;
-    let slide = base.wrapping_sub(preferred);
+    // The run holding the header decides the slide; the others follow it, as
+    // xnu slides every segment of an image by the same amount.
+    let first = runs
+        .iter()
+        .position(|r| r.contains(&preferred))
+        .unwrap_or(0);
+    let mut span = 0;
+    let mut slide: Word = 0;
+    for i in core::iter::once(first).chain((0..runs.len()).filter(|&i| i != first)) {
+        let run = &runs[i];
+        let len = usize::try_from(run.end - run.start)
+            .map_err(|_| Error::Memory("segment run too large"))?;
+        let placement = if i != first {
+            Placement::Fixed(run.start.wrapping_add(slide))
+        } else if obj.is_pie() {
+            Placement::Preferred(run.start)
+        } else {
+            Placement::Fixed(run.start)
+        };
+        let got = mem.reserve(len, gran as usize, placement)?;
+        if i == first {
+            slide = got.wrapping_sub(run.start);
+        }
+        span += len;
+    }
+    let base = preferred.wrapping_add(slide);
 
     let bytes = obj.bytes();
     for seg in obj.mappable_segments() {
@@ -218,6 +231,29 @@ pub fn map_segments_from<S: MachSpec, M: AddressSpace>(
         entry: obj.entry().map(|e| e.address(base, slide)),
         entry_command: obj.entry(),
     })
+}
+
+/// The address ranges to reserve: mappable segments rounded out to `gran`,
+/// merged where they touch, in address order.
+///
+/// One range per run rather than one spanning the image, because the gaps
+/// between segments are not the image's. Wine's loader puts zero-fill segments
+/// at `0x1000` and `0x7ff0_0000_0000` around a header at `0x2_0000_0000`, and a
+/// single reservation would claim the whole 128 TiB between them.
+fn reservation_runs<S: MachSpec>(obj: &MachObject<'_, S>, gran: Word) -> Vec<Range<Word>> {
+    let mut segs: Vec<Range<Word>> = obj
+        .mappable_segments()
+        .map(|s| align_down(s.vmaddr, gran)..align_up(s.vmend(), gran))
+        .collect();
+    segs.sort_unstable_by_key(|r| r.start);
+    let mut runs: Vec<Range<Word>> = Vec::with_capacity(segs.len());
+    for seg in segs {
+        match runs.last_mut() {
+            Some(last) if seg.start <= last.end => last.end = last.end.max(seg.end),
+            _ => runs.push(seg),
+        }
+    }
+    runs
 }
 
 /// Apply each segment's `initprot`, reconciled against the host's protection
