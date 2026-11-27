@@ -292,8 +292,9 @@ pub mod emulated {
                 // FPU | TSC | CX8 | CMOV | SSE | SSE2
                 let edx = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 25) | (1 << 26);
 
-                // SSE3 (bit 0) | SSSE3 (bit 9) | SSE4.1 (bit 19) | SSE4.2 (bit 20) | AES-NI (bit 25) | Hypervisor (bit 31)
-                let ecx = (1 << 0) | (1 << 9) | (1 << 19) | (1 << 20) | (1 << 25) | (1 << 31);
+                // SSE3 (bit 0) | SSSE3 (bit 9) | SSE4.1 (bit 19) | SSE4.2 (bit 20) | AES-NI (bit 25) | AVX (bit 28) | Hypervisor (bit 31)
+                let ecx =
+                    (1 << 0) | (1 << 9) | (1 << 19) | (1 << 20) | (1 << 25) | (1 << 28) | (1 << 31);
 
                 [version, misc, ecx, edx]
             }
@@ -384,7 +385,7 @@ mod tests {
         assert_eq!(eax, MAX_BASIC_LEAF);
     }
 
-    /// The whole point of the reply: SSE2 yes, everything microlift cannot lift no.
+    /// Advertise the baseline plus VEX 128 support, and nothing unsupported.
     #[test]
     fn leaf_one_advertises_the_baseline_and_no_more() {
         let [_, _, ecx, edx] = cpuid(1, 0);
@@ -406,10 +407,10 @@ mod tests {
             (23, "popcnt"),
             (26, "xsave"),
             (27, "osxsave"),
-            (28, "avx"),
         ] {
             assert_eq!(ecx & (1 << bit), 0, "{name} should not be advertised");
         }
+        assert_ne!(ecx & (1 << 28), 0, "AVX should advertise VEX 128 support");
         // Emulated, and saying so.
         assert_ne!(ecx & (1 << 31), 0, "hypervisor bit should be set");
     }
