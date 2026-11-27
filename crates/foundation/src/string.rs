@@ -1500,6 +1500,55 @@ unsafe extern "C" fn localized_compare(receiver: Id, sel: Sel, other: Id) -> isi
     }
 }
 
+/// `-localizedStandardCompare:`, the Finder's order: case-insensitive, runs
+/// of digits by their value, and a tie broken as `-localizedCompare:` does.
+///
+/// FIXME (ACCURACY): no locale collation, so letters order by their folded
+/// scalar values, as in `-localizedCompare:`.
+unsafe extern "C" fn localized_standard_compare(receiver: Id, sel: Sel, other: Id) -> isize {
+    // SAFETY: the caller's two strings.
+    let (a, b) = unsafe { folded(receiver, other) };
+    match numeric_order(&a, &b) {
+        // SAFETY: as above.
+        std::cmp::Ordering::Equal => unsafe { localized_compare(receiver, sel, other) },
+        order => ordering(order),
+    }
+}
+
+/// `a` against `b` by character, except that a run of ASCII digits against
+/// another compares by the number it spells.
+fn numeric_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let run = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+                    let mut digits = String::new();
+                    while let Some(c) = chars.next_if(char::is_ascii_digit) {
+                        digits.push(c);
+                    }
+                    digits.trim_start_matches('0').to_string()
+                };
+                let (x, y) = (run(&mut a), run(&mut b));
+                match x.len().cmp(&y.len()).then_with(|| x.cmp(&y)) {
+                    std::cmp::Ordering::Equal => {}
+                    order => return order,
+                }
+            }
+            (Some(x), Some(y)) => match x.cmp(&y) {
+                std::cmp::Ordering::Equal => {
+                    a.next();
+                    b.next();
+                }
+                order => return order,
+            },
+        }
+    }
+}
+
 unsafe extern "C" fn int_value(receiver: Id, _sel: Sel) -> i32 {
     // SAFETY: an `NSString`.
     parse_leading(&unsafe { bytes(receiver) }).map_or(0, |v| v as i32)
@@ -1955,6 +2004,7 @@ pub(crate) fn install() {
         "caseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
         "localizedCaseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
         "localizedCompare:" => localized_compare, c"q24@0:8@16";
+        "localizedStandardCompare:" => localized_standard_compare, c"q24@0:8@16";
         "isLike:" => is_like, c"B24@0:8@16";
         "isCaseSensitiveLike:" => is_like, c"B24@0:8@16";
         "isCaseInsensitiveLike:" => is_case_insensitive_like, c"B24@0:8@16";
@@ -2047,6 +2097,25 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_compare_orders_numbers_by_value_and_ignores_case() {
+        crate::bootstrap();
+        let compare = |a: &str, b: &str| {
+            // SAFETY: two strings.
+            unsafe {
+                localized_standard_compare(
+                    from_str(a),
+                    objc::sel::get("localizedStandardCompare:"),
+                    from_str(b),
+                )
+            }
+        };
+        assert_eq!(compare("File 9", "File 10"), -1);
+        assert_eq!(compare("file 10", "File 9"), 1);
+        assert_eq!(compare("Alpha", "beta"), -1);
+        assert_eq!(compare("abc", "abc"), 0);
+    }
 
     /// `-isLike:` matches case exactly, as `-isCaseSensitiveLike:` does;
     /// `-isCaseInsensitiveLike:` folds case first.
