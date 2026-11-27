@@ -1441,7 +1441,7 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
 /// Each subview is *sent* `-resizeWithOldSuperviewSize:` rather than having its
 /// frame written here, because that is the method AppKit documents as the one a
 /// view overrides to lay itself out - so a guest's override has to be what runs.
-fn resize_subviews(receiver: Id, old: NSSize) {
+pub(crate) fn resize_subviews(receiver: Id, old: NSSize) {
     let view = view_of(receiver);
     if view.does_not_autoresize_subviews != 0 || view.subviews.is_null() {
         return;

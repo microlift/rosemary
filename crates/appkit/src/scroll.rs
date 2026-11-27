@@ -276,6 +276,17 @@ unsafe extern "C" fn scroll_tile(receiver: Id, _sel: Sel) {
     }
 }
 
+/// `-resizeSubviewsWithOldSize:`: a scroll view lays out its parts anew
+/// whenever it changes size, as AppKit's does through `-tile`.
+unsafe extern "C" fn scroll_resize_subviews(receiver: Id, _sel: Sel, old: NSSize) {
+    crate::view::resize_subviews(receiver, old);
+    // SAFETY: `-tile` is `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("tile"));
+    }
+}
+
 unsafe extern "C" fn scroll_content_size(receiver: Id, _sel: Sel) -> NSSize {
     crate::view::frame_of(clip_view_of(receiver)).size
 }
@@ -404,6 +415,7 @@ pub(crate) fn install() {
         "documentVisibleRect" => scroll_document_visible_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "contentSize" => scroll_content_size, c"{CGSize=dd}16@0:8";
         "tile" => scroll_tile, c"v16@0:8";
+        "resizeSubviewsWithOldSize:" => scroll_resize_subviews, c"v32@0:8{CGSize=dd}16";
         "scrollWheel:" => scroll_wheel, c"v24@0:8@16";
         "setHasVerticalScroller:" => ignored_flag, c"v20@0:8c16";
         "setHasHorizontalScroller:" => ignored_flag, c"v20@0:8c16";
@@ -458,4 +470,46 @@ pub(crate) fn install() {
         "scrollPoint:" => view_scroll_point, c"v32@0:8{CGPoint=dd}16";
         "autoscroll:" => view_autoscroll, c"c24@0:8@16";
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_resized_scroll_view_resizes_its_clip_view() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSScrollView").expect("NSScrollView");
+        let frame = |width, height| NSRect {
+            origin: NSPoint::default(),
+            size: NSSize { width, height },
+        };
+        let scroll = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)` and
+        // `-setFrameSize:` `void (id, SEL, NSSize)`.
+        let scroll = unsafe {
+            let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let scroll = init(
+                scroll,
+                objc::sel::get("initWithFrame:"),
+                frame(814.0, 434.0),
+            );
+            let resize: unsafe extern "C" fn(Id, Sel, NSSize) =
+                std::mem::transmute(objc::msg::entry());
+            resize(
+                scroll,
+                objc::sel::get("setFrameSize:"),
+                NSSize {
+                    width: 888.0,
+                    height: 603.0,
+                },
+            );
+            scroll
+        };
+        assert_eq!(
+            crate::view::frame_of(clip_view_of(scroll)),
+            frame(888.0, 603.0)
+        );
+    }
 }
