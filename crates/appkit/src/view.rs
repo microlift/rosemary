@@ -3350,6 +3350,10 @@ unsafe extern "C" fn set_translates_autoresizing_mask(receiver: Id, _sel: Sel, f
     crate::layout::solve();
 }
 
+unsafe extern "C" fn no_baseline_offset(_receiver: Id, _sel: Sel) -> f64 {
+    0.0
+}
+
 unsafe extern "C" fn translates_autoresizing_mask(receiver: Id, _sel: Sel) -> u8 {
     u8::from(view_of(receiver).constrained == 0)
 }
@@ -3760,6 +3764,9 @@ pub(crate) fn install() {
         "setTranslatesAutoresizingMaskIntoConstraints:" => set_translates_autoresizing_mask,
             c"v20@0:8c16";
         "translatesAutoresizingMaskIntoConstraints" => translates_autoresizing_mask, c"c16@0:8";
+        // A view with no text has no baseline of its own.
+        "firstBaselineOffsetFromTop" => no_baseline_offset, c"d16@0:8";
+        "lastBaselineOffsetFromBottom" => no_baseline_offset, c"d16@0:8";
         // `NSUserInterfaceItemIdentification`.
         "identifier" => crate::props::get_object, c"@16@0:8";
         "setIdentifier:" => crate::props::set_copied, c"v24@0:8@16";

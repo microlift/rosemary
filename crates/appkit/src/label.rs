@@ -242,6 +242,53 @@ unsafe extern "C" fn intrinsic_content_size(receiver: Id, _sel: Sel) -> NSSize {
     })
 }
 
+/// The lines a wrapping field breaks `text` into, `room` points wide.
+fn wrapped_lines(look: &Look, font: &chrome::Font, size: f32, text: &str, room: f32) -> Vec<String> {
+    let mut lines = match look.line_break {
+        CHAR_WRAP => char_wrap(font, text, size, room),
+        _ => font.wrap(text, size, room),
+    };
+    if look.max_lines > 0 {
+        lines.truncate(look.max_lines as usize);
+    }
+    lines
+}
+
+/// Where `-drawRect:` sets the field's text: its first baseline from the
+/// top, and its last from the bottom.
+fn baselines(receiver: Id) -> (f64, f64) {
+    let look = look(receiver);
+    let bounds = view::bounds_of(receiver);
+    let height = bounds.size.height as f32;
+    let Some((font, size)) = font_of(&look) else {
+        return (0.0, 0.0);
+    };
+    let size = size as f32;
+    let (first, last) = match look.wraps() {
+        true => {
+            let (ascent, descent) = font.metrics(size);
+            let text = crate::text::field_text(receiver);
+            let room = (bounds.size.width as f32 - 2.0 * PADDING as f32).max(0.0);
+            let lines = wrapped_lines(&look, &font, size, &text, room).len().max(1);
+            let first = ascent.round();
+            (first, first + (lines - 1) as f32 * (ascent + descent).ceil())
+        }
+        false => {
+            let baseline = font.centered_baseline(size, 0.0, height);
+            (baseline, baseline)
+        }
+    };
+    (f64::from(first), f64::from(height - last))
+}
+
+unsafe extern "C" fn first_baseline_offset_from_top(receiver: Id, _sel: Sel) -> f64 {
+    baselines(receiver).0
+}
+
+unsafe extern "C" fn last_baseline_offset_from_bottom(receiver: Id, _sel: Sel) -> f64 {
+    baselines(receiver).1
+}
+
 unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
     let look = look(receiver);
     let bounds = view::bounds_of(receiver);
@@ -283,13 +330,7 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
             // A wrapping field sets its lines from the top, as a Mac's does.
             true => {
                 let (ascent, descent) = font.metrics(size);
-                let mut lines = match look.line_break {
-                    CHAR_WRAP => char_wrap(&font, &text, size, room),
-                    _ => font.wrap(&text, size, room),
-                };
-                if look.max_lines > 0 {
-                    lines.truncate(look.max_lines as usize);
-                }
+                let lines = wrapped_lines(&look, &font, size, &text, room);
                 let leading = (ascent + descent).ceil();
                 for (i, line) in lines.iter().enumerate() {
                     let baseline = ascent.round() + i as f32 * leading;
@@ -455,6 +496,8 @@ pub(crate) fn install() {
         "setWraps:" => set_wraps, c"v20@0:8c16";
         "wraps" => wraps, c"c16@0:8";
         "intrinsicContentSize" => intrinsic_content_size, c"{CGSize=dd}16@0:8";
+        "firstBaselineOffsetFromTop" => first_baseline_offset_from_top, c"d16@0:8";
+        "lastBaselineOffsetFromBottom" => last_baseline_offset_from_bottom, c"d16@0:8";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
     });
 }
@@ -481,5 +524,45 @@ mod tests {
         assert_eq!(sized.height, empty.height);
         assert_eq!(look(label).alignment, CENTER);
         forget(label);
+    }
+
+    fn send_f64(receiver: Id, sel: &str) -> f64 {
+        // SAFETY: `CGFloat (id, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(sel))
+        }
+    }
+
+    fn make(class: &std::ffi::CStr, frame: NSRect) -> Id {
+        crate::bootstrap();
+        let object = objc::object::create_instance(objc::class::lookup(class).expect("a class"), 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(object, objc::sel::get("initWithFrame:"), frame)
+        }
+    }
+
+    /// A one-line field's baselines are where it draws its line: inside it,
+    /// the same distance from top and bottom as the centred line puts it; a
+    /// plain view has none.
+    #[test]
+    fn a_fields_baselines_are_where_its_line_is_drawn() {
+        let frame = NSRect {
+            origin: foundation::geometry::NSPoint::default(),
+            size: NSSize {
+                width: 100.0,
+                height: 22.0,
+            },
+        };
+        let field = make(c"NSTextField", frame);
+        let first = send_f64(field, "firstBaselineOffsetFromTop");
+        let last = send_f64(field, "lastBaselineOffsetFromBottom");
+        assert!(first > 0.0 && first < 22.0, "{first}");
+        assert_eq!(first + last, 22.0);
+        let view = make(c"NSView", frame);
+        assert_eq!(send_f64(view, "firstBaselineOffsetFromTop"), 0.0);
     }
 }
