@@ -2045,6 +2045,27 @@ unsafe extern "C" fn image_view_image(receiver: Id, _sel: Sel) -> Id {
     read(image_views(), receiver, slot::VIEW_IMAGE) as Id
 }
 
+fn send_size(receiver: Id, sel: &str) -> NSSize {
+    // SAFETY: `NSSize (id, SEL)`, two doubles returned in registers.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSSize = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel))
+    }
+}
+
+/// `-intrinsicContentSize`: the image's size, or none without an image.
+unsafe extern "C" fn image_view_intrinsic_size(receiver: Id, _sel: Sel) -> NSSize {
+    let image = read(image_views(), receiver, slot::VIEW_IMAGE) as Id;
+    match image.is_null() {
+        // `NSViewNoIntrinsicMetric`.
+        true => NSSize {
+            width: -1.0,
+            height: -1.0,
+        },
+        false => send_size(image, "size"),
+    }
+}
+
 unsafe extern "C" fn image_view_set_scaling(receiver: Id, _sel: Sel, value: usize) {
     write(image_views(), receiver, slot::SCALING, value);
     crate::backing::needs_display(receiver);
@@ -2859,6 +2880,7 @@ pub(crate) fn install() {
     methods!(class, {
         "setImage:" => image_view_set_image, c"v24@0:8@16";
         "image" => image_view_image, c"@16@0:8";
+        "intrinsicContentSize" => image_view_intrinsic_size, c"{CGSize=dd}16@0:8";
         "setImageScaling:" => image_view_set_scaling, c"v24@0:8Q16";
         "imageScaling" => image_view_scaling, c"Q16@0:8";
         "setImageAlignment:" => image_view_set_alignment, c"v24@0:8Q16";
@@ -2912,6 +2934,36 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_view_is_as_big_as_its_image() {
+        crate::bootstrap();
+        let view_class = objc::class::lookup(c"NSImageView").expect("NSImageView");
+        let view = objc::object::create_instance(view_class, 0);
+        assert_eq!(send_size(view, "intrinsicContentSize").width, -1.0);
+        let image_class = objc::class::lookup(c"NSImage").expect("NSImage");
+        // SAFETY: `-initWithSize:` is `id (id, SEL, NSSize)`.
+        let image = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSSize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                objc::object::create_instance(image_class, 0),
+                objc::sel::get("initWithSize:"),
+                NSSize {
+                    width: 32.0,
+                    height: 21.0,
+                },
+            )
+        };
+        send_object(view, "setImage:", image);
+        assert_eq!(
+            send_size(view, "intrinsicContentSize"),
+            NSSize {
+                width: 32.0,
+                height: 21.0
+            }
+        );
+    }
 
     #[test]
     fn box_border_width_is_one_point_until_set() {
