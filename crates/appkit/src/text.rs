@@ -1223,8 +1223,23 @@ unsafe extern "C" fn current_editor(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
-unsafe extern "C" fn field_mouse_down(receiver: Id, _sel: Sel, _event: Id) {
-    if !field(receiver).editable {
+unsafe extern "C" fn field_mouse_down(receiver: Id, sel: Sel, event: Id) {
+    let state = field(receiver);
+    if !state.editable && !state.selectable {
+        // A label takes no part in the click, which goes on up the responder
+        // chain: a click on a table cell's text selects the row.
+        let control = objc::class::lookup(c"NSControl").expect("declared before its methods");
+        if let Some(method) = control.method(sel) {
+            // SAFETY: `-mouseDown:` is `void (id, SEL, NSEvent *)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id) =
+                    std::mem::transmute(method.implementation());
+                f(receiver, sel, event);
+            }
+        }
+        return;
+    }
+    if !state.editable {
         return;
     }
     // SAFETY: the receiver is a text-field view from this runtime.
@@ -1762,6 +1777,58 @@ mod tests {
         crate::bootstrap();
         let class = objc::class::lookup(c"NSTextField").expect("NSTextField");
         objc::object::create_instance(class, 0)
+    }
+
+    static CLICKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_click(receiver: Id, _sel: Sel, _event: Id) {
+        CLICKED.store(receiver as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn send_view(receiver: Id, sel: &str, argument: Id) {
+        // SAFETY: `void (id, SEL, id)`, as each selector this is used with is.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(sel), argument);
+        }
+    }
+
+    /// A label takes no part in a click, which reaches the view it is in.
+    #[test]
+    fn a_click_on_a_label_goes_to_the_view_it_is_in() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"RosemaryTestClickCatcher").unwrap_or_else(|| {
+            let class = corefoundation::base::register(
+                c"RosemaryTestClickCatcher",
+                objc::class::lookup(c"NSView"),
+                crate::view::INSTANCE_SIZE,
+                false,
+            );
+            crate::define::methods!(class, {
+                "mouseDown:" => record_click, c"v24@0:8@16";
+            });
+            class
+        });
+        let catcher = objc::object::create_instance(class, 0);
+        // SAFETY: `-init` is `id (id, SEL)`.
+        let catcher = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(catcher, objc::sel::get("init"))
+        };
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let label = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(text_field(), objc::sel::get("initWithFrame:"), NSRect::default())
+        };
+        send_view(catcher, "addSubview:", label);
+        // SAFETY: the field's own setters, `void (id, SEL, BOOL)`.
+        unsafe {
+            field_set_editable(label, objc::sel::get("setEditable:"), 0);
+            field_set_selectable(label, objc::sel::get("setSelectable:"), 0);
+        }
+        send_view(label, "mouseDown:", std::ptr::null_mut());
+        assert_eq!(CLICKED.load(std::sync::atomic::Ordering::Relaxed), catcher as usize);
     }
 
     /// The whole point of storing rather than ignoring: what was set is what is
