@@ -3630,6 +3630,10 @@ unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     }
     if was != (hidden != 0) {
         notify_metal_scene(receiver);
+        // A stack detaches its hidden views, so the others move.
+        if crate::controls::is_arranged(receiver) {
+            crate::layout::solve();
+        }
     }
 }
 

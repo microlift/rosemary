@@ -50,6 +50,9 @@ const GREATER_OR_EQUAL: isize = 1;
 /// defaults for hugging and for compression resistance.
 const DEFAULT_HUGGING: f32 = 250.0;
 const DEFAULT_COMPRESSION_RESISTANCE: f32 = 750.0;
+/// `NSStackView`'s default hugging and clipping resistance priorities.
+const STACK_HUGGING: f32 = 250.0;
+const STACK_CLIPPING_RESISTANCE: f32 = REQUIRED;
 
 /// Each view's content hugging and compression resistance, horizontal then
 /// vertical, for the views that were given any.
@@ -238,14 +241,67 @@ fn placed_by_container(view: Id) -> bool {
     crate::controls::is_arranged(view) || crate::split::is_pane(view)
 }
 
+/// Whether `c` ties a stack to a view it arranges. The stack places that view
+/// itself after the solve, honouring such constraints across its axis (see
+/// [`pinned_across`]); in the solve they would hold the stack to the view's
+/// old frame.
+fn inside_stack(c: &Constraint) -> bool {
+    let arranged_in = |child: Id, stack: Id| {
+        view::is_view(child)
+            && crate::controls::is_arranged(child)
+            // SAFETY: a view of this crate's.
+            && unsafe { view::superview_of(child) } == stack
+    };
+    view::is_view(c.second) && (arranged_in(c.first, c.second) || arranged_in(c.second, c.first))
+}
+
+/// How far required constraints hold `child` in from its stack's edges across
+/// the stack's axis: the left and right edges of a vertical stack, the bottom
+/// and top of a horizontal one, in that order.
+pub(crate) fn pinned_across(stack: Id, child: Id, vertical: bool) -> (Option<f64>, Option<f64>) {
+    let mut pins = (None, None);
+    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    for c in active.iter().map(|c| &*constraint_of(*c as Id)) {
+        if c.relation != EQUAL
+            || c.priority < REQUIRED
+            || (c.multiplier - 1.0).abs() > f64::EPSILON
+            || c.first_attribute != c.second_attribute
+        {
+            continue;
+        }
+        // The child's edge less the stack's, as the attribute measures: right
+        // and down are positive, as AppKit's top and bottom grow downward.
+        let offset = match (c.first, c.second) {
+            (first, second) if first == child && second == stack => c.constant,
+            (first, second) if first == stack && second == child => -c.constant,
+            _ => continue,
+        };
+        match (vertical, c.first_attribute) {
+            // Left and leading, right and trailing.
+            (true, 1 | 5) => pins.0 = Some(offset),
+            (true, 2 | 6) => pins.1 = Some(-offset),
+            // Bottom, then top.
+            (false, 4) => pins.0 = Some(-offset),
+            (false, 3) => pins.1 = Some(offset),
+            _ => {}
+        }
+    }
+    pins
+}
+
 /// What pulls a view towards its smallest size when its fitting size is
 /// asked for: above the stays, below every real priority.
 const FIT: f64 = 1e-2;
 
 /// Solve `constraints` and the frames they leave fixed. Answers each view of
 /// the system with where the solution puts it, in its superview, and the
-/// root's size when `root` asks for a fitting size.
-fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRect)>, NSSize) {
+/// root's size when `root` asks for one: as near each of `pull`'s lengths, a
+/// width then a height, as its strength holds it.
+fn solve_system(
+    constraints: &[&Constraint],
+    root: Option<Id>,
+    pull: [(f64, f64); 2],
+) -> (Vec<(Id, NSRect)>, NSSize) {
     let mut system = System {
         views: Vec::new(),
         index: std::collections::HashMap::new(),
@@ -258,6 +314,7 @@ fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRe
         .iter()
         .copied()
         .filter(|c| system.within(c.first) && (!view::is_view(c.second) || system.within(c.second)))
+        .filter(|c| !inside_stack(c))
         .collect();
     for c in &constraints {
         for item in [c.first, c.second] {
@@ -342,8 +399,9 @@ fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRe
         }
         match fitting {
             true => {
-                pin(&mut solver, w, 0.0, FIT);
-                pin(&mut solver, h, 0.0, FIT);
+                let [(width, width_pull), (height, height_pull)] = pull;
+                pin(&mut solver, w, width, width_pull);
+                pin(&mut solver, h, height, height_pull);
             }
             false => {
                 pin(&mut solver, w, frame.size.width, strength);
@@ -404,6 +462,26 @@ fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRe
                     e,
                     Relation::GreaterOrEqual,
                     self::strength(resistance),
+                );
+            }
+        }
+        // A stack hugs its arranged views at its hugging priority and never
+        // clips them, as the constraints AppKit's stack makes of them say.
+        if let Some((size, hugging)) = crate::controls::arranged_size(view, STACK_HUGGING) {
+            for (v, length, hugging) in [(w, size.width, hugging[0]), (h, size.height, hugging[1])]
+            {
+                let e = var(v).add_constant(-length);
+                add(
+                    &mut solver,
+                    e.clone(),
+                    Relation::LessOrEqual,
+                    self::strength(hugging),
+                );
+                add(
+                    &mut solver,
+                    e,
+                    Relation::GreaterOrEqual,
+                    self::strength(STACK_CLIPPING_RESISTANCE),
                 );
             }
         }
@@ -510,6 +588,22 @@ fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRe
 /// `-[NSView fittingSize]`: the smallest size the view's own constraints and
 /// its subviews' allow.
 unsafe extern "C" fn fitting_size(receiver: Id, _sel: Sel) -> NSSize {
+    size_nearest(receiver, [(0.0, FIT); 2])
+}
+
+/// The size a stack gives `view` across its axis: as near `room` as the view's
+/// own constraints allow, as the stack hugs it at its hugging priority, and
+/// otherwise its fitting size. `vertical` names the cross axis.
+pub(crate) fn hugged_size(view: Id, room: f64, vertical: bool) -> NSSize {
+    let hug = (room, strength(STACK_HUGGING));
+    let pull = match vertical {
+        true => [(0.0, FIT), hug],
+        false => [hug, (0.0, FIT)],
+    };
+    size_nearest(view, pull)
+}
+
+fn size_nearest(receiver: Id, pull: [(f64, f64); 2]) -> NSSize {
     if !SOLVING.get() {
         update_constraints();
     }
@@ -519,7 +613,7 @@ unsafe extern "C" fn fitting_size(receiver: Id, _sel: Sel) -> NSSize {
     }
     let constraints: Vec<&Constraint> =
         snapshot.iter().map(|c| &*constraint_of(*c as Id)).collect();
-    let (_, size) = solve_system(&constraints, Some(receiver));
+    let (_, size) = solve_system(&constraints, Some(receiver), pull);
     for c in snapshot {
         objc::arc::release(c as Id);
     }
@@ -638,7 +732,7 @@ fn pass() -> bool {
     }
     let constraints: Vec<&Constraint> =
         snapshot.iter().map(|c| &*constraint_of(*c as Id)).collect();
-    let (mut placed, _) = solve_system(&constraints, None);
+    let (mut placed, _) = solve_system(&constraints, None, [(0.0, FIT); 2]);
     // Parents first: a parent's new size resizes its autoresizing children,
     // which the next pass then holds where that left them.
     // SAFETY: views of this crate's.
@@ -1200,6 +1294,11 @@ fn priority_slot(compression: bool, orientation: isize) -> usize {
     usize::from(compression) * 2 + usize::from(orientation != 0)
 }
 
+/// `view`'s content hugging priority along `orientation`, 0 for horizontal.
+pub(crate) fn hugging_priority(view: Id, orientation: isize) -> f32 {
+    content_priority(view, priority_slot(false, orientation))
+}
+
 fn content_priority(view: Id, slot: usize) -> f32 {
     CONTENT_PRIORITIES
         .lock()
@@ -1696,6 +1795,7 @@ mod tests {
     #[test]
     fn a_stack_aligned_by_width_stretches_what_it_arranges() {
         let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::bootstrap();
         let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
         let stack = objc::object::create_instance(class, 0);
         // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
@@ -1726,6 +1826,322 @@ mod tests {
         for row in rows {
             assert_eq!(view::frame_of(row).size.width, 200.0);
         }
+    }
+
+    /// CrossOver's package list: a vertical, leading-aligned stack pinned to
+    /// its container, and its arranged view pinned to both of its sides.
+    #[test]
+    fn a_view_pinned_to_its_stacks_sides_stretches_with_the_stack() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let root = view(rect(0.0, 0.0, 888.0, 659.0));
+        let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
+        let stack = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let stack = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                stack,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 814.0, 490.0),
+            )
+        };
+        // SAFETY: both setters take an `NSInteger`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, isize) = std::mem::transmute(objc::msg::entry());
+            f(stack, objc::sel::get("setOrientation:"), 1);
+            f(stack, objc::sel::get("setAlignment:"), 5);
+        }
+        send(root, "addSubview:", stack);
+        constrain(stack);
+        let header = view(rect(0.0, 0.0, 814.0, 48.0));
+        constrain(header);
+        send(stack, "addArrangedSubview:", header);
+        // The stack's own constraints first, as a nib installs them.
+        let array = activate(&[
+            pin(header, 5, stack, 0.0),
+            pin(stack, 6, header, 0.0),
+            pin(stack, 5, root, 0.0),
+            pin(root, 6, stack, 0.0),
+            pin(stack, 3, root, 0.0),
+            pin(root, 4, stack, 0.0),
+        ]);
+        layout_now();
+        assert_eq!(view::frame_of(stack), rect(0.0, 0.0, 888.0, 659.0));
+        assert_eq!(view::frame_of(header).size.width, 888.0);
+        assert_eq!(view::frame_of(header).origin.x, 0.0);
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    /// CrossOver's rating stars: a horizontal stack placed by its top and
+    /// leading edges only, whose height is its stars'.
+    #[test]
+    fn a_stack_placed_by_one_corner_is_as_tall_as_what_it_arranges() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let root = view(rect(0.0, 0.0, 380.0, 52.0));
+        let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
+        let stack = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let stack = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                stack,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 0.0, 0.0),
+            )
+        };
+        send(root, "addSubview:", stack);
+        constrain(stack);
+        let star = view(rect(0.0, 0.0, 32.0, 21.0));
+        constrain(star);
+        send(stack, "addArrangedSubview:", star);
+        let array = activate(&[
+            pin(stack, 5, root, 0.0),
+            pin(stack, 3, root, 0.0),
+            relate(star, 8, std::ptr::null_mut(), 0, 21.0),
+            relate(star, 7, std::ptr::null_mut(), 0, 32.0),
+            pin(star, 8, stack, 0.0),
+        ]);
+        layout_now();
+        assert_eq!(
+            view::frame_of(stack).size,
+            NSSize {
+                width: 32.0,
+                height: 21.0
+            }
+        );
+        assert_eq!(
+            view::frame_of(star).size,
+            NSSize {
+                width: 32.0,
+                height: 21.0
+            }
+        );
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    /// CrossOver's package list again: a header that hugs its height and a
+    /// scroll view that takes the rest of a filling stack.
+    #[test]
+    fn a_filling_stack_gives_its_spare_length_to_the_loosest_view() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
+        let stack = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let stack = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                stack,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 200.0, 300.0),
+            )
+        };
+        let header = view(rect(0.0, 0.0, 200.0, 48.0));
+        let body = view(rect(0.0, 0.0, 200.0, 100.0));
+        constrain(header);
+        constrain(body);
+        let array = activate(&[relate(header, 8, std::ptr::null_mut(), 0, 48.0)]);
+        // SAFETY: the setters' own prototypes.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, isize) = std::mem::transmute(objc::msg::entry());
+            f(stack, objc::sel::get("setOrientation:"), 1);
+            f(stack, objc::sel::get("setDistribution:"), 0);
+            let hug: unsafe extern "C" fn(Id, Sel, f32, isize) =
+                std::mem::transmute(objc::msg::entry());
+            hug(
+                header,
+                objc::sel::get("setContentHuggingPriority:forOrientation:"),
+                1000.0,
+                1,
+            );
+        }
+        send(stack, "addArrangedSubview:", header);
+        send(stack, "addArrangedSubview:", body);
+        solve();
+        layout_now();
+        assert_eq!(view::frame_of(header), rect(0.0, 252.0, 200.0, 48.0));
+        assert_eq!(view::frame_of(body), rect(0.0, 0.0, 200.0, 244.0));
+        // Hiding a view detaches it, and showing it again takes its room back.
+        // SAFETY: `-setHidden:` takes one `BOOL`.
+        let hide = |hidden: u8| unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+            f(body, objc::sel::get("setHidden:"), hidden);
+        };
+        hide(1);
+        layout_now();
+        assert_eq!(view::frame_of(header), rect(0.0, 0.0, 200.0, 300.0));
+        hide(0);
+        layout_now();
+        assert_eq!(view::frame_of(body), rect(0.0, 0.0, 200.0, 244.0));
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    fn image_view(width: f64, height: f64, hugging: f32) -> Id {
+        let class = objc::class::lookup(c"NSImageView").expect("NSImageView");
+        let view = objc::object::create_instance(class, 0);
+        let image_class = objc::class::lookup(c"NSImage").expect("NSImage");
+        // SAFETY: the methods' own prototypes.
+        unsafe {
+            let init: unsafe extern "C" fn(Id, Sel, NSSize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let image = init(
+                objc::object::create_instance(image_class, 0),
+                objc::sel::get("initWithSize:"),
+                NSSize { width, height },
+            );
+            send(view, "setImage:", image);
+            let hug: unsafe extern "C" fn(Id, Sel, f32, isize) =
+                std::mem::transmute(objc::msg::entry());
+            hug(
+                view,
+                objc::sel::get("setContentHuggingPriority:forOrientation:"),
+                hugging,
+                0,
+            );
+        }
+        constrain(view);
+        view
+    }
+
+    /// CrossOver's rating: stars in an equally filling stack that hug harder
+    /// than the label after them, which takes the room left over.
+    #[test]
+    fn a_filling_stack_hugs_as_hard_as_its_views() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::bootstrap();
+        let root = view(rect(0.0, 0.0, 400.0, 21.0));
+        let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
+        let stack = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)` and
+        // `-setDistribution:` takes an `NSInteger`.
+        let stack = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let stack = f(
+                stack,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 300.0, 21.0),
+            );
+            let set: unsafe extern "C" fn(Id, Sel, isize) = std::mem::transmute(objc::msg::entry());
+            set(stack, objc::sel::get("setDistribution:"), 1);
+            stack
+        };
+        send(root, "addSubview:", stack);
+        constrain(stack);
+        let stars = [image_view(22.0, 21.0, 251.0), image_view(22.0, 21.0, 251.0)];
+        for star in stars {
+            send(stack, "addArrangedSubview:", star);
+        }
+        let label = image_view(22.0, 21.0, 250.0);
+        send(root, "addSubview:", label);
+        let array = activate(&[
+            pin(stack, 5, root, 0.0),
+            pin(stack, 3, root, 0.0),
+            relate(label, 5, stack, 6, 10.0),
+            pin(label, 6, root, 0.0),
+            pin(label, 3, root, 0.0),
+        ]);
+        layout_now();
+        assert_eq!(view::frame_of(stack).size.width, 52.0);
+        assert_eq!(view::frame_of(stars[1]).size.width, 22.0);
+        assert_eq!(view::frame_of(label).size.width, 338.0);
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    #[test]
+    fn a_stack_keeps_a_taller_view_within_its_height() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
+        let stack = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let stack = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                stack,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 200.0, 52.0),
+            )
+        };
+        let tall = view(rect(0.0, 0.0, 80.0, 73.0));
+        send(stack, "addArrangedSubview:", tall);
+        let array = activate(&[
+            relate(tall, 7, std::ptr::null_mut(), 0, 80.0),
+            relate(tall, 8, std::ptr::null_mut(), 0, 73.0),
+        ]);
+        solve();
+        layout_now();
+        assert_eq!(view::frame_of(tall), rect(0.0, 0.0, 80.0, 52.0));
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    /// CrossOver's package rows: a view whose subviews hang from its top, with
+    /// nothing to say how tall it is, fills its stack's height.
+    #[test]
+    fn a_view_with_no_height_of_its_own_fills_its_stack_across() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSStackView").expect("NSStackView");
+        let stack = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let stack = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                stack,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 400.0, 52.0),
+            )
+        };
+        let row = view(rect(0.0, 0.0, 380.0, 30.0));
+        let title = view(rect(0.0, 0.0, 380.0, 21.0));
+        send(row, "addSubview:", title);
+        constrain(title);
+        send(stack, "addArrangedSubview:", row);
+        let array = activate(&[
+            relate(row, 7, std::ptr::null_mut(), 0, 380.0),
+            pin(title, 3, row, 0.0),
+            pin(title, 5, row, 0.0),
+            relate(title, 8, std::ptr::null_mut(), 0, 21.0),
+        ]);
+        solve();
+        layout_now();
+        assert_eq!(view::frame_of(row), rect(0.0, 0.0, 380.0, 52.0));
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
     }
 
     fn rect_message(receiver: Id, selector: &str, rect: NSRect) -> NSRect {

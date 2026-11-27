@@ -21,7 +21,9 @@ pub struct NSEdgeInsets {
 /// `NSUserInterfaceLayoutOrientation`.
 const VERTICAL: isize = 1;
 /// `NSStackViewDistribution`.
+const FILL: isize = 0;
 const FILL_EQUALLY: isize = 1;
+const FILL_PROPORTIONALLY: isize = 2;
 /// `NSStackViewGravity`: leading and top are 1, centre 2, trailing and bottom 3.
 const GRAVITY_CENTER: isize = 2;
 const GRAVITY_TRAILING: isize = 3;
@@ -186,6 +188,44 @@ pub(crate) fn required_size(v: Id) -> Option<NSSize> {
     Some(size)
 }
 
+fn send_size(receiver: Id, sel: &str) -> NSSize {
+    // SAFETY: `NSSize (id, SEL)`, two doubles returned in registers.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSSize = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel))
+    }
+}
+
+/// The size a stack's arranged views need, and how strongly it holds to that
+/// size horizontally and vertically, or `None` for a view that is not a stack
+/// arranging any.
+///
+/// A filling stack ties its views end to end, so along its axis it hugs them
+/// as hard as the most tightly hugging of them does.
+pub(crate) fn arranged_size(v: Id, hugging: f32) -> Option<(NSSize, [f32; 2])> {
+    let stack = stacks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(v as usize))
+        .filter(|s| !s.views.is_empty())
+        .cloned()?;
+    let along = isize::from(stack.orientation == VERTICAL);
+    let fills = matches!(
+        stack.distribution,
+        FILL | FILL_EQUALLY | FILL_PROPORTIONALLY
+    );
+    let views_hugging = stack
+        .views
+        .iter()
+        .map(|(view, _)| crate::layout::hugging_priority(*view as Id, along))
+        .fold(hugging, f32::max);
+    let mut priorities = [hugging; 2];
+    if fills {
+        priorities[along as usize] = views_hugging;
+    }
+    Some((content_fitting_size(v, 0), priorities))
+}
+
 /// [`fitting_size`] before the view's own size constraints.
 fn content_fitting_size(v: Id, depth: usize) -> NSSize {
     if let Some(size) = crate::label::intrinsic_size(v) {
@@ -197,7 +237,24 @@ fn content_fitting_size(v: Id, depth: usize) -> NSSize {
         .get(&(v as usize))
         .cloned();
     let Some(stack) = nested.filter(|s| !s.views.is_empty() && depth < 16) else {
-        return view::frame_of(v).size;
+        if sized_by_subviews(v) {
+            return send_size(v, "fittingSize");
+        }
+        // A frame a stack set says nothing of what the view needs, so its
+        // content's own size comes first where it has one.
+        let frame = view::frame_of(v).size;
+        let content = match view::is_constrained(v) {
+            true => send_size(v, "intrinsicContentSize"),
+            false => frame,
+        };
+        let own = |content: f64, frame: f64| match content < 0.0 {
+            true => frame,
+            false => content,
+        };
+        return NSSize {
+            width: own(content.width, frame.width),
+            height: own(content.height, frame.height),
+        };
     };
     let vertical = stack.orientation == VERTICAL;
     let sizes: Vec<NSSize> = stack
@@ -277,6 +334,36 @@ fn arrange(receiver: Id, stack: &Stack) -> bool {
         for (i, (v, _)) in views.iter().enumerate() {
             spans.push((*v, lead + i as f64 * (each + spacing), each));
         }
+    } else if stack.distribution == FILL {
+        // The views fill the stack end to end; what their own lengths leave
+        // over, or lack, goes to the one that hugs its content least.
+        //
+        // FIXME (ACCURACY): AppKit's layout is ambiguous when two views tie
+        // for the lowest priority; the last of them takes the difference here.
+        let orientation = isize::from(vertical);
+        let lengths: Vec<f64> = views.iter().map(|(v, _)| extent(*v).0).collect();
+        let used = lengths.iter().sum::<f64>() + spacing * (views.len() - 1) as f64;
+        let slack = length - lead - trail - used;
+        let loosest = views
+            .iter()
+            .enumerate()
+            .min_by(|(a, (x, _)), (b, (y, _))| {
+                let (x, y) = (
+                    crate::layout::hugging_priority(*x, orientation),
+                    crate::layout::hugging_priority(*y, orientation),
+                );
+                x.total_cmp(&y).then(b.cmp(a))
+            })
+            .map(|(i, _)| i);
+        let mut at = lead;
+        for (i, ((v, _), natural)) in views.iter().zip(lengths).enumerate() {
+            let along = match Some(i) == loosest {
+                true => (natural + slack).max(0.0),
+                false => natural,
+            };
+            spans.push((*v, at, along));
+            at += along + spacing;
+        }
     } else {
         let group = |gravity: &dyn Fn(isize) -> bool| -> Vec<(Id, f64)> {
             views
@@ -309,11 +396,13 @@ fn arrange(receiver: Id, stack: &Stack) -> bool {
         true => stack.alignment == 7,
         false => stack.alignment == 8,
     };
+    // An arranged view never reaches past the stack's edges across its axis.
+    let room = (cross - cross_lead - cross_trail).max(0.0);
     let mut moved = false;
     for (v, at, along) in spans {
         let across = match fills {
-            true => (cross - cross_lead - cross_trail).max(0.0),
-            false => extent(v).1,
+            true => room,
+            false => across_extent(v, room, vertical),
         };
         // Distance from the cross axis's bottom or left edge. Edge alignments
         // across the stack's axis hug that edge; every other one centres.
@@ -324,6 +413,13 @@ fn arrange(receiver: Id, stack: &Stack) -> bool {
             3 if !vertical => cross - cross_trail - across,
             4 if !vertical => cross_lead,
             _ => cross_lead + (cross - cross_lead - cross_trail - across) / 2.0,
+        };
+        // Constraints between the stack and the view outrank its alignment.
+        let (across, offset) = match crate::layout::pinned_across(receiver, v, vertical) {
+            (Some(near), Some(far)) => ((cross - near - far).max(0.0), near),
+            (Some(near), None) => (across, near),
+            (None, Some(far)) => (across, cross - far - across),
+            (None, None) => (across, offset),
         };
         let frame = if vertical {
             let y = if flipped {
@@ -355,6 +451,43 @@ fn arrange(receiver: Id, stack: &Stack) -> bool {
         moved |= crate::layout::set_frame(v, frame);
     }
     moved
+}
+
+/// Whether `v` is as big as the constraints of the subviews it contains say,
+/// rather than its frame: a view constrained from outside that is not a
+/// label or a stack, which size themselves, and has subviews.
+///
+/// A constrained view's frame is the one a stack last gave it, so only what
+/// is inside it says how big it wants to be.
+///
+/// FIXME (ACCURACY): a leaf view with no `-intrinsicContentSize` keeps its
+/// frame as the size of its content, because the controls without one here
+/// (buttons among them) would otherwise have none.
+fn sized_by_subviews(v: Id) -> bool {
+    let is_stack = stacks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(v as usize))
+        .is_some_and(|s| !s.views.is_empty());
+    view::is_constrained(v)
+        && !is_stack
+        && crate::label::intrinsic_size(v).is_none()
+        && !view::subviews_of(v).is_empty()
+}
+
+/// How long an arranged view is across its stack: as near the stack's `room`
+/// as a container's constraints allow, which is where the stack's hugging
+/// pulls it, or what any other view's content needs.
+fn across_extent(v: Id, room: f64, vertical: bool) -> f64 {
+    let size = match sized_by_subviews(v) {
+        true => crate::layout::hugged_size(v, room, !vertical),
+        false => fitting_size(v, 0),
+    };
+    match vertical {
+        true => size.width,
+        false => size.height,
+    }
+    .min(room)
 }
 
 /// Place every stack's arranged subviews; whether any of them moved.
@@ -2043,14 +2176,6 @@ unsafe extern "C" fn image_view_set_image(receiver: Id, _sel: Sel, image: Id) {
 
 unsafe extern "C" fn image_view_image(receiver: Id, _sel: Sel) -> Id {
     read(image_views(), receiver, slot::VIEW_IMAGE) as Id
-}
-
-fn send_size(receiver: Id, sel: &str) -> NSSize {
-    // SAFETY: `NSSize (id, SEL)`, two doubles returned in registers.
-    unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> NSSize = std::mem::transmute(objc::msg::entry());
-        f(receiver, objc::sel::get(sel))
-    }
 }
 
 /// `-intrinsicContentSize`: the image's size, or none without an image.
