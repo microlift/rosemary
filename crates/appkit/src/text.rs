@@ -1129,9 +1129,15 @@ unsafe extern "C" fn field_object_value(receiver: Id, sel: Sel) -> Id {
     unsafe { field_string_value(receiver, sel) }
 }
 
-/// `-setObjectValue:`: with no formatter, the value's `-description` - which
-/// a string answers with itself - and the empty string for nil.
+/// `-setObjectValue:`: with no formatter, an attributed string as itself,
+/// anything else as its `-description` - which a string answers with itself -
+/// and the empty string for nil.
 unsafe extern "C" fn field_set_object_value(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: null or an object.
+    if unsafe { foundation::attributed_string::parts(value) }.is_some() {
+        // SAFETY: an attributed string.
+        return unsafe { field_set_attributed_string_value(receiver, sel, value) };
+    }
     let text = match value.is_null() {
         true => std::ptr::null_mut(),
         // SAFETY: `-description` is `id (id, SEL)` on any object.
@@ -1142,6 +1148,64 @@ unsafe extern "C" fn field_set_object_value(receiver: Id, sel: Sel, value: Id) {
     };
     // SAFETY: the same receiver, and a string or nil.
     unsafe { field_set_string_value(receiver, sel, text) }
+}
+
+/// The attributed string a field was last given, while its text is still
+/// that string's.
+fn attributed_key() -> *const std::ffi::c_void {
+    static KEY: u8 = 0;
+    (&raw const KEY).cast()
+}
+
+/// `-setAttributedStringValue:`: the string's text, and the string itself for
+/// `-attributedStringValue`.
+///
+/// FIXME (ACCURACY): the field draws the text in its own font and colour,
+/// not the runs' attributes.
+unsafe extern "C" fn field_set_attributed_string_value(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: null or an attributed string.
+    let text = unsafe { foundation::attributed_string::parts(value) }.map(|(text, _)| text);
+    let string = foundation::string::from_str(text.as_deref().unwrap_or(""));
+    // SAFETY: the same receiver, and a string.
+    unsafe { field_set_string_value(receiver, sel, string) };
+    objc::arc::release(string);
+    let copy = match value.is_null() {
+        true => std::ptr::null_mut(),
+        // SAFETY: `-copy` is `id (id, SEL)`.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(value, objc::sel::get("copy"))
+        },
+    };
+    // The field's text was just set from `value`, which is what keeps it.
+    objc::arc::set_associated_with_policy(receiver, attributed_key(), copy, 1);
+    objc::arc::release(copy);
+}
+
+/// `-attributedStringValue`: the attributed string the field was given, or
+/// its text with no attributes.
+unsafe extern "C" fn field_attributed_string_value(receiver: Id, _sel: Sel) -> Id {
+    let text = field(receiver).text;
+    let given = objc::arc::associated(receiver, attributed_key());
+    // SAFETY: an attributed string this field kept.
+    if let Some((kept, _)) = unsafe { foundation::attributed_string::parts(given) }
+        && kept == text
+    {
+        return given;
+    }
+    let class = objc::class::lookup(c"NSAttributedString").expect("Foundation registered it");
+    let string = foundation::string::from_str(&text);
+    // SAFETY: `-initWithString:` is `id (id, SEL, NSString *)` on a fresh object.
+    let made = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+        f(
+            objc::object::create_instance(class, 0),
+            objc::sel::get("initWithString:"),
+            string,
+        )
+    };
+    objc::arc::release(string);
+    objc::arc::autorelease(made)
 }
 
 unsafe extern "C" fn field_set_string_value(receiver: Id, _sel: Sel, value: Id) {
@@ -1700,6 +1764,8 @@ pub(crate) fn install() {
         "setStringValue:" => field_set_string_value, c"v24@0:8@16";
         "objectValue" => field_object_value, c"@16@0:8";
         "setObjectValue:" => field_set_object_value, c"v24@0:8@16";
+        "attributedStringValue" => field_attributed_string_value, c"@16@0:8";
+        "setAttributedStringValue:" => field_set_attributed_string_value, c"v24@0:8@16";
         "setEditable:" => field_set_editable, c"v20@0:8c16";
         "isEditable" => field_is_editable, c"c16@0:8";
         "setSelectable:" => field_set_selectable, c"v20@0:8c16";
@@ -1716,6 +1782,42 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CrossOver binds a package's description, an attributed string, to a
+    /// label's value.
+    #[test]
+    fn an_attributed_object_value_shows_its_text() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSTextField").expect("NSTextField");
+        let label = objc::object::create_instance(class, 0);
+        let text = foundation::string::from_str("Runs great");
+        let attributed_class =
+            objc::class::lookup(c"NSAttributedString").expect("NSAttributedString");
+        // SAFETY: `-initWithString:` is `id (id, SEL, NSString *)`.
+        let attributed = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                objc::object::create_instance(attributed_class, 0),
+                objc::sel::get("initWithString:"),
+                text,
+            )
+        };
+        // SAFETY: the methods' own prototypes.
+        unsafe {
+            field_set_object_value(label, objc::sel::get("setObjectValue:"), attributed);
+            assert_eq!(field_text(label), "Runs great");
+            let kept =
+                field_attributed_string_value(label, objc::sel::get("attributedStringValue"));
+            assert_eq!(
+                foundation::attributed_string::parts(kept)
+                    .map(|(text, _)| text)
+                    .as_deref(),
+                Some("Runs great")
+            );
+        }
+        crate::label::forget(label);
+    }
 
     static SELECTION_EVENTS: Mutex<Vec<(&'static str, String, NSRange)>> = Mutex::new(Vec::new());
 
