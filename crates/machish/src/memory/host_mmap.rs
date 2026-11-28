@@ -191,16 +191,25 @@ impl MmapSpace {
     ///
     /// Returns `Ok(None)` if the kernel placed us elsewhere, having already
     /// released the mapping it gave us - the caller decides whether that is a
-    /// slide to accept or an error.
-    fn try_reserve_at(&mut self, size: usize, want: Word) -> Result<Option<Word>> {
+    /// slide to accept or an error. With `exact`, the kernel is asked for
+    /// `want` or nothing where it can be: Linux moves a bare hint below the
+    /// lowest address it hands out on its own (0x8000 on arm64), though it
+    /// maps lower when asked outright, as Wine's loader needs from 0x1000.
+    fn try_reserve_at(&mut self, size: usize, want: Word, exact: bool) -> Result<Option<Word>> {
         let hint = usize::try_from(want).map_err(|_| Error::Memory("placement too high"))?;
-        let (prot, flags) = self.mmap_flags();
+        let (prot, mut flags) = self.mmap_flags();
+        if exact {
+            flags |= map_exact();
+        }
 
-        // SAFETY: anonymous mmap with an *advisory* hint - no MAP_FIXED, so the
-        // kernel relocates us rather than unmapping anything already at `hint`.
-        // The result is checked against MAP_FAILED before use.
+        // SAFETY: anonymous mmap with an *advisory* hint, or one that fails
+        // rather than replace a mapping - never MAP_FIXED, so nothing already
+        // at `hint` is unmapped. The result is checked against MAP_FAILED.
         let raw = unsafe { libc::mmap(hint as *mut c_void, size, prot, flags, -1, 0) };
         if raw == libc::MAP_FAILED {
+            if exact && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                return Ok(None);
+            }
             return Err(Error::Memory("mmap failed"));
         }
         if raw as usize != hint {
@@ -264,12 +273,12 @@ impl AddressSpace for MmapSpace {
 
         match placement {
             Placement::Anywhere => self.reserve_anywhere(size, align),
-            Placement::Preferred(want) => match self.try_reserve_at(size, want)? {
+            Placement::Preferred(want) => match self.try_reserve_at(size, want, false)? {
                 Some(base) => Ok(base),
                 None => self.reserve_anywhere(size, align),
             },
             Placement::Fixed(want) => self
-                .try_reserve_at(size, want)?
+                .try_reserve_at(size, want, true)?
                 .ok_or(Error::Memory("fixed placement unavailable")),
         }
     }
@@ -410,6 +419,19 @@ impl Drop for MmapSpace {
             }
         }
     }
+}
+
+/// The flag that makes an mmap hint exact without replacing what is there.
+/// Kernels too old to know it treat it as a plain hint, which the caller's
+/// address check still catches.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn map_exact() -> libc::c_int {
+    libc::MAP_FIXED_NOREPLACE
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn map_exact() -> libc::c_int {
+    0
 }
 
 #[cfg(target_os = "macos")]
