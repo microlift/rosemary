@@ -1507,6 +1507,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("FSPathMoveObjectToTrashSync", I32, P, P, U32),
     sig!("FSFileOperationCreate", P, P),
     sig!("FSFileOperationScheduleWithRunLoop", V, P, P, P),
+    sig!("MPCurrentTaskID", P),
+    sig!("MPTaskIsPreemptive", U8, P),
     sig!("CSCopyMachineName", P),
     sig!("GetCurrentProcess", I32, P),
     sig!("GetFrontProcess", I32, P),
