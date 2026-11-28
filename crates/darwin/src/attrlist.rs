@@ -1,4 +1,5 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::stat::Stat;
 
@@ -19,6 +20,7 @@ const ATTR_BIT_MAP_COUNT: u16 = 5;
 
 const ATTR_CMN_NAME: u32 = 0x0000_0001;
 const ATTR_CMN_DEVID: u32 = 0x0000_0002;
+const ATTR_CMN_FSID: u32 = 0x0000_0004;
 const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
 const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
 const ATTR_CMN_CHGTIME: u32 = 0x0000_0800;
@@ -46,6 +48,7 @@ const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
 const ATTR_FILE_DATAALLOCSIZE: u32 = 0x0000_0400;
 
 const COMMON: u32 = ATTR_CMN_DEVID
+    | ATTR_CMN_FSID
     | ATTR_CMN_OBJTYPE
     | ATTR_CMN_MODTIME
     | ATTR_CMN_CHGTIME
@@ -186,6 +189,7 @@ fn pack(
     name: Option<&[u8]>,
     entries: impl FnOnce() -> u32,
     finder: impl FnOnce() -> [u8; 32],
+    fsid: impl FnOnce() -> [i32; 2],
 ) -> Vec<u8> {
     let zero = Stat::default();
     let (st, error) = match found {
@@ -239,6 +243,11 @@ fn pack(
     let i64_ = |out: &mut Vec<u8>, v: i64| out.extend_from_slice(&v.to_ne_bytes());
     if common & ATTR_CMN_DEVID != 0 {
         u32_(&mut out, st.dev as u32);
+    }
+    if common & ATTR_CMN_FSID != 0 {
+        let [low, high] = if error == 0 { fsid() } else { [0; 2] };
+        out.extend_from_slice(&low.to_ne_bytes());
+        out.extend_from_slice(&high.to_ne_bytes());
     }
     if common & ATTR_CMN_OBJTYPE != 0 {
         u32_(&mut out, object_type(st.mode));
@@ -415,6 +424,8 @@ pub unsafe extern "C" fn getattrlist(
                         crate::xattr::get_on_host(host, FINDER_INFO, info, nofollow)
                     })
                 },
+                // SAFETY: as above, and a live local.
+                || volume_id(|fs| unsafe { libc::statfs(host.as_ptr(), fs) }),
             )
         });
         (answer, rc == 0)
@@ -423,6 +434,69 @@ pub unsafe extern "C" fn getattrlist(
         Some(answer) => unsafe { copy_out(answer, options, buf, size) },
         None => -1,
     }
+}
+
+/// The `fsid_t` `statfs` reports for the volume `ask` fills a host `statfs`
+/// for, so that the two calls agree; zero if the host cannot say.
+fn volume_id(ask: impl FnOnce(*mut libc::statfs) -> c_int) -> [i32; 2] {
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if ask(fs.as_mut_ptr()) != 0 {
+        return [0; 2];
+    }
+    // SAFETY: filled by the host just above.
+    let fs = unsafe { fs.assume_init() };
+    crate::stat::fsid_of(&fs)
+}
+
+/// `int getattrlistat(int, const char *, struct attrlist *, void *, size_t,
+/// unsigned long)`
+///
+/// A relative path under a real directory is answered as the path the guest
+/// would spell from that directory's own guest path, so it is translated and
+/// case-folded exactly as [`getattrlist`]'s are.
+///
+/// # Safety
+///
+/// As [`getattrlist`], with `dirfd` a directory descriptor or Darwin's
+/// `AT_FDCWD`.
+pub unsafe extern "C" fn getattrlistat(
+    dirfd: c_int,
+    path: *const c_char,
+    list: *const AttrList,
+    buf: *mut c_void,
+    size: usize,
+    options: u64,
+) -> c_int {
+    if path.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    // SAFETY: non-null, and NUL-terminated by contract.
+    let relative = unsafe { CStr::from_ptr(path) };
+    if relative.is_empty() {
+        // Darwin has no `AT_EMPTY_PATH`: an empty path names nothing.
+        crate::errno::set(libc::ENOENT);
+        return -1;
+    }
+    if dirfd == crate::stat::DARWIN_AT_FDCWD || relative.to_bytes().first() == Some(&b'/') {
+        // SAFETY: the caller's obligations, unchanged.
+        return unsafe { getattrlist(path, list, buf, size, options) };
+    }
+    let Some(directory) = starnix::fd::path(dirfd) else {
+        crate::errno::set(libc::EBADF);
+        return -1;
+    };
+    let Some(mut guest) = prefix::ns::to_guest(&directory) else {
+        crate::errno::set(libc::ENOENT);
+        return -1;
+    };
+    guest.push(std::ffi::OsStr::from_bytes(relative.to_bytes()));
+    let Ok(guest) = std::ffi::CString::new(guest.into_os_string().into_vec()) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    // SAFETY: a NUL-terminated path, and the caller's other obligations.
+    unsafe { getattrlist(guest.as_ptr(), list, buf, size, options) }
 }
 
 /// `int fgetattrlist(int, struct attrlist *, void *, size_t, unsigned int)`
@@ -471,6 +545,8 @@ pub unsafe extern "C" fn fgetattrlist(
         },
         // SAFETY: the caller's descriptor, and a name this module owns.
         || finder_info(|info| unsafe { crate::xattr::get_on_fd(fd, FINDER_INFO, info) }),
+        // SAFETY: the caller's descriptor, and a live local.
+        || volume_id(|fs| unsafe { libc::fstatfs(fd, fs) }),
     );
     unsafe { copy_out(answer, options, buf, size) }
 }
@@ -632,6 +708,30 @@ pub unsafe extern "C" fn getattrlistbulk(
             Some(name.to_bytes()),
             entries,
             finder,
+            || {
+                // SAFETY: the listed directory and one of its names.
+                let at = unsafe {
+                    libc::openat(
+                        fd,
+                        name.as_ptr(),
+                        libc::O_RDONLY
+                            | libc::O_NONBLOCK
+                            | libc::O_NOCTTY
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                    )
+                };
+                // An entry that cannot be opened is read through its directory,
+                // whose volume it shares unless it is a mount point.
+                let of = if at < 0 { fd } else { at };
+                // SAFETY: a live descriptor and a live local.
+                let id = volume_id(|fs| unsafe { libc::fstatfs(of, fs) });
+                if at >= 0 {
+                    // SAFETY: opened just above.
+                    unsafe { libc::close(at) };
+                }
+                id
+            },
         );
         if out.len() + packed.len() > size {
             state.pending = Some(entry);
@@ -1132,6 +1232,7 @@ pub unsafe extern "C" fn fsetattrlist(
 exports::exports! {
     functions {
         "getattrlist" => getattrlist,
+        "getattrlistat" => getattrlistat,
         "fgetattrlist" => fgetattrlist,
         "getattrlistbulk" => getattrlistbulk,
         "setattrlist" => setattrlist,
@@ -1544,7 +1645,15 @@ mod tests {
             ATTR_DIR_LINKCOUNT,
             ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE,
         );
-        let b = pack(&l, 0, Ok(&st), None, || unreachable!(), || unreachable!());
+        let b = pack(
+            &l,
+            0,
+            Ok(&st),
+            None,
+            || unreachable!(),
+            || unreachable!(),
+            || unreachable!(),
+        );
         // Length, returned set, OBJTYPE, OWNERID, FILE_LINKCOUNT, ALLOCSIZE;
         // the directory attribute is left out for a file.
         assert_eq!(b.len(), 4 + 20 + 4 + 4 + 4 + 8);

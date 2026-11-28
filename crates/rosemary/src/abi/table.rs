@@ -2362,6 +2362,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fgetxattr", I64, I32, P, P, U64, U32, I32),
     sig!("getentropy", I32, P, U64),
     sig!("getattrlist", I32, P, P, P, U64, U64),
+    sig!("getattrlistat", I32, I32, P, P, P, U64, U64),
     sig!("fgetattrlist", I32, I32, P, P, U64, U64),
     sig!("fsetattrlist", I32, I32, P, P, U64, U64),
     // `int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t)`

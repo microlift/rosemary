@@ -1182,6 +1182,12 @@ fn unsigned(count: u64) -> u64 {
     count
 }
 
+/// A host `f_fsid` as Darwin's two words.
+pub(crate) fn fsid_of(host: &libc::statfs) -> [i32; 2] {
+    // SAFETY: two 32-bit halves on both sides.
+    unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(host.f_fsid) }
+}
+
 unsafe fn fill_statfs(host: &libc::statfs, out: *mut Statfs) {
     if out.is_null() {
         return;
@@ -1196,7 +1202,7 @@ unsafe fn fill_statfs(host: &libc::statfs, out: *mut Statfs) {
         ffree: unsigned(host.f_ffree),
         // Two 32-bit halves on both sides, and opaque on both: it is only ever
         // compared against another `f_fsid`.
-        fsid: unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(host.f_fsid) },
+        fsid: fsid_of(host),
         owner: 0,
         fstype: 0,
         // This host's `struct statfs` carries no mount-flag word at all - the
