@@ -324,6 +324,10 @@ mod refkind {
     pub const RECEIVE: u8 = 2;
     /// A right whose port is gone.
     pub const DEAD: u8 = 3;
+    /// A send right to a task: its guest pid in `peer`, its image in `address`.
+    pub const TASK: u8 = 4;
+    /// A send right to a thread: its host pid in `peer`, its tid in `address`.
+    pub const THREAD: u8 = 5;
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +346,9 @@ struct Reference {
     claims: u16,
     complete: bool,
     address: u64,
+    /// The process a task or thread right belongs to, carried where a port
+    /// right's descriptor bookkeeping would be.
+    peer: i32,
 }
 
 impl Reference {
@@ -353,15 +360,25 @@ impl Reference {
         claims: 0,
         complete: false,
         address: 0,
+        peer: 0,
     };
+
+    fn names_a_process(&self) -> bool {
+        matches!(self.kind, refkind::TASK | refkind::THREAD)
+    }
 
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.kind);
         out.push(self.disposition);
         out.extend_from_slice(&self.fd_index.to_le_bytes());
-        let extra = u32::from(self.claims)
-            | u32::from(self.listener) << 16
-            | u32::from(self.complete) << 17;
+        let extra = match self.names_a_process() {
+            true => self.peer as u32,
+            false => {
+                u32::from(self.claims)
+                    | u32::from(self.listener) << 16
+                    | u32::from(self.complete) << 17
+            }
+        };
         out.extend_from_slice(&extra.to_le_bytes());
         out.extend_from_slice(&self.address.to_le_bytes());
     }
@@ -369,7 +386,7 @@ impl Reference {
     fn decode(bytes: &[u8]) -> Option<Reference> {
         let bytes: &[u8; REFERENCE] = bytes.get(..REFERENCE)?.try_into().ok()?;
         let extra = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-        Some(Reference {
+        let decoded = Reference {
             kind: bytes[0],
             disposition: bytes[1],
             fd_index: i16::from_le_bytes([bytes[2], bytes[3]]),
@@ -377,6 +394,17 @@ impl Reference {
             claims: (extra & 0xffff) as u16,
             complete: extra & 1 << 17 != 0,
             address: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            peer: 0,
+        };
+        Some(match decoded.names_a_process() {
+            true => Reference {
+                listener: false,
+                claims: 0,
+                complete: false,
+                peer: extra as i32,
+                ..decoded
+            },
+            false => decoded,
         })
     }
 
@@ -420,6 +448,8 @@ impl Reference {
                 None => MACH_PORT_DEAD,
             },
             refkind::DEAD => MACH_PORT_DEAD,
+            refkind::TASK => space::insert_task(self.peer, self.address),
+            refkind::THREAD => space::insert_thread(self.peer, self.address as i32),
             _ => MACH_PORT_NULL,
         }
     }
@@ -491,6 +521,11 @@ impl Pending {
     }
 }
 
+/// Whether `name` holds a right to a real port, which crosses by its address.
+fn is_port(name: Name) -> bool {
+    space::address_of(name).is_some()
+}
+
 /// Turn `name`, held under `disposition`, into something that can cross.
 fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), i32> {
     if name == MACH_PORT_NULL {
@@ -519,8 +554,35 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     claims: 0,
                     complete: moved.complete,
                     address,
+                    peer: 0,
                 },
                 Some(Pending::Receive { moved, address }),
+            ))
+        }
+        // `MAKE_SEND` needs a receive right, which no task or thread has.
+        COPY_SEND | MOVE_SEND if !is_port(name) => {
+            // A task or thread is no port with an address: it crosses as the
+            // process and the thread it names.
+            let (kind, peer, address) = match space::task_of(name) {
+                Some((pid, image)) => (refkind::TASK, pid, image),
+                None => {
+                    let (pid, tid) = space::thread_of(name).ok_or(MACH_SEND_INVALID_RIGHT)?;
+                    (refkind::THREAD, pid, tid as u64)
+                }
+            };
+            let held = match disposition {
+                MOVE_SEND => Pending::Moved(name),
+                _ => Pending::Copied,
+            };
+            Ok((
+                Reference {
+                    kind,
+                    disposition: MOVE_SEND as u8,
+                    address,
+                    peer,
+                    ..Reference::NONE
+                },
+                Some(held),
             ))
         }
         MAKE_SEND | COPY_SEND | MOVE_SEND => {
@@ -538,6 +600,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     claims: 0,
                     complete: false,
                     address,
+                    peer: 0,
                 },
                 Some(held),
             ))
@@ -557,6 +620,7 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     claims: 0,
                     complete: false,
                     address,
+                    peer: 0,
                 },
                 Some(held),
             ))

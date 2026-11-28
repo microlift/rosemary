@@ -308,6 +308,21 @@ pub fn insert_task(pid: i32, image: u64) -> Name {
     })
 }
 
+/// The task `name` is a send right to, as `(guest pid, image)`: this one for
+/// [`TASK_SELF`], or another guest's.
+pub fn task_of(name: Name) -> Option<(i32, u64)> {
+    if name == TASK_SELF {
+        let pid = crate::process::guest_pid(own_pid());
+        let image = crate::process::describe(pid).map_or(0, |p| p.image);
+        return Some((pid, image));
+    }
+    let guard = space().read().unwrap_or_else(|e| e.into_inner());
+    match guard.names.get(&name) {
+        Some(Right::Task { pid, image, .. }) => Some((*pid, *image)),
+        _ => None,
+    }
+}
+
 /// Which task an operation names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
