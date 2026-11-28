@@ -58,6 +58,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "_NSURLVolumeAvailableCapacityKey",
         VOLUME_AVAILABLE_CAPACITY,
     ),
+    (
+        "_kCFURLVolumeAvailableCapacityForImportantUsageKey",
+        VOLUME_AVAILABLE_CAPACITY_FOR_IMPORTANT_USAGE,
+    ),
     ("_kCFURLVolumeIdentifierKey", VOLUME_IDENTIFIER),
     ("_NSURLVolumeIdentifierKey", VOLUME_IDENTIFIER),
     ("_kCFURLPathKey", PATH),
@@ -146,6 +150,8 @@ const QUARANTINE_PROPERTIES: &str = "NSURLQuarantinePropertiesKey";
 const VOLUME_URL: &str = "NSURLVolumeURLKey";
 const VOLUME_TOTAL_CAPACITY: &str = "NSURLVolumeTotalCapacityKey";
 const VOLUME_AVAILABLE_CAPACITY: &str = "NSURLVolumeAvailableCapacityKey";
+const VOLUME_AVAILABLE_CAPACITY_FOR_IMPORTANT_USAGE: &str =
+    "NSURLVolumeAvailableCapacityForImportantUsageKey";
 const VOLUME_IDENTIFIER: &str = "NSURLVolumeIdentifierKey";
 const PATH: &str = "_NSURLPathKey";
 const IS_VOLUME: &str = "NSURLIsVolumeKey";
@@ -386,6 +392,9 @@ pub fn property(guest: &str, key: &str) -> Option<CFTypeRef> {
         VOLUME_URL => crate::url::new_file_url(&volume_of(path).to_string_lossy(), true),
         VOLUME_TOTAL_CAPACITY => number(capacity(path)?.0),
         VOLUME_AVAILABLE_CAPACITY => number(capacity(path)?.1),
+        // What a Mac adds to the available capacity is purgeable storage it
+        // would evict for the user, which no host keeps.
+        VOLUME_AVAILABLE_CAPACITY_FOR_IMPORTANT_USAGE => number(capacity(path)?.1),
         // The volume's device number, which is exactly what the key is for:
         // telling whether two URLs are on the same volume.
         VOLUME_IDENTIFIER => number(device_of(path)?),
