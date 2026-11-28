@@ -379,6 +379,21 @@ pub unsafe extern "C" fn opendir(path: *const c_char) -> *mut libc::DIR {
     dir
 }
 
+/// `DIR *fdopendir(int)`
+///
+/// # Safety
+///
+/// No obligations beyond those of the host's own.
+pub unsafe extern "C" fn fdopendir(fd: c_int) -> *mut libc::DIR {
+    // SAFETY: the host checks the descriptor.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if !dir.is_null() {
+        // As in `opendir`: a reused address must not inherit a listing.
+        entries(|open| open.remove(&(dir as usize)));
+    }
+    dir
+}
+
 /// `int scandir(const char *, struct dirent ***, int (*)(const struct dirent *),
 /// int (*)(const struct dirent **, const struct dirent **))`
 ///
@@ -655,6 +670,7 @@ pub const REFUSED: &[&str] = &["getdirentries"];
 exports::exports! {
     functions {
         "opendir" => opendir,
+        "fdopendir" => fdopendir,
         "readdir" => readdir_unsuffixed,
         "readdir$INODE64" => readdir,
         "readdir_r" => readdir_r,

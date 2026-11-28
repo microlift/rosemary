@@ -2012,6 +2012,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("ceil", F64, F64),
     sig!("ceilf", F32, F32),
     sig!("chdir", I32, P),
+    sig!("fchdir", I32, I32),
     sig!("chmod", I32, P, U32),
     // `filesec_t` is opaque; `chmodx_np` and the `statx_np` family take one
     // after the path or descriptor and the `struct stat`.
@@ -3269,6 +3270,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("open_dprotected_np", I32, P, I32, I32, I32, U32),
     sig!("openat", I32, I32, P, I32, U32),
     sig!("opendir", P, P),
+    sig!("fdopendir", P, I32),
     sig!("openlog", V, P, I32, I32),
     sig!("pathconf", I64, P, I32),
     sig!("pclose", I32, P),
