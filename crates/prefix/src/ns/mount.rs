@@ -210,6 +210,58 @@ impl Table {
         }
     }
 
+    /// Whether `relative`, resolved against a directory, could leave the mount
+    /// that directory is in: through `..`, or into a mount point by name.
+    ///
+    /// Lexical and conservative, so the common relative lookup costs no more
+    /// than a scan of its components.
+    pub fn may_leave_mount(&self, relative: &str) -> bool {
+        !self.is_identity()
+            && relative.split('/').any(|part| {
+                part == ".."
+                    || self.by_guest.iter().filter(|m| m.guest != "/").any(|m| {
+                        m.guest
+                            .rsplit_once('/')
+                            .is_some_and(|(_, name)| name == part)
+                    })
+            })
+    }
+
+    /// Whether the absolute `guest` path names a mount point somewhere other
+    /// than where it is mounted, as `/a/link/Volumes/Host` does: only a
+    /// symlink on the way could make that the mount, and the host kernel
+    /// would follow the link without it.
+    pub fn names_mount_elsewhere(&self, guest: &str) -> bool {
+        let Some(normalised) = normalise(guest) else {
+            return false;
+        };
+        self.by_guest.iter().filter(|m| m.guest != "/").any(|m| {
+            let Some((_, name)) = m.guest.rsplit_once('/') else {
+                return false;
+            };
+            normalised
+                .match_indices(&format!("/{name}"))
+                .map(|(at, _)| at + name.len() + 1)
+                .filter(|&end| normalised[end..].is_empty() || normalised[end..].starts_with('/'))
+                .any(|end| normalised[..end] != m.guest)
+        })
+    }
+
+    /// The host path `relative` names under the host directory `dir`, when
+    /// that is not the one the kernel would find by resolving it against
+    /// `dir` - because it crosses into another mount, or climbs out of this
+    /// one. `None` when the kernel's answer is already the guest's.
+    pub fn to_host_beneath(&self, dir: &Path, relative: &str) -> Option<PathBuf> {
+        if !self.may_leave_mount(relative) {
+            return None;
+        }
+        let guest = self.to_guest(dir)?;
+        let guest = format!("{}/{relative}", trimmed(guest.to_str()?));
+        let host = self.to_host(&guest)?;
+        // Compared by component, so a spelling difference alone is no crossing.
+        (host != dir.join(relative)).then_some(host)
+    }
+
     /// Every mount point but the root, as the directory listing it sits in
     /// sees it.
     ///
@@ -595,6 +647,45 @@ mod tests {
             table().to_host("/private/etc/resolv.conf/../hosts"),
             Some(PathBuf::from("/etc/resolv.conf/../hosts"))
         );
+    }
+
+    #[test]
+    fn a_mount_named_below_another_directory_is_noticed() {
+        let table = table();
+        assert!(table.names_mount_elsewhere("/Users/u/.wine/dosdevices/z:/Volumes/Host/home"));
+        assert!(!table.names_mount_elsewhere("/Volumes/Host/home"));
+        assert!(!table.names_mount_elsewhere("/Users/u/Hostess"));
+    }
+
+    #[test]
+    fn a_relative_walk_into_a_mount_crosses_it() {
+        let table = table();
+        let root = table.to_host("/").unwrap();
+        assert_eq!(
+            table.to_host_beneath(&root, "Volumes/Host/etc"),
+            Some(PathBuf::from("/etc"))
+        );
+    }
+
+    #[test]
+    fn a_relative_climb_out_of_a_mount_lands_in_its_guest_parent() {
+        let table = table();
+        let root = table.to_host("/").unwrap();
+        assert_eq!(
+            table.to_host_beneath(Path::new("/"), ".."),
+            Some(root.join("Volumes"))
+        );
+    }
+
+    #[test]
+    fn a_relative_walk_within_a_mount_is_left_to_the_kernel() {
+        let table = table();
+        let root = table.to_host("/").unwrap();
+        assert_eq!(
+            table.to_host_beneath(&root, "usr/lib/libSystem.B.dylib"),
+            None
+        );
+        assert_eq!(table.to_host_beneath(&root.join("usr/lib"), "../bin"), None);
     }
 
     /// The escape hatch is reachable by name and nowhere else.

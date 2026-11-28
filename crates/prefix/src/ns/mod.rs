@@ -209,7 +209,11 @@ pub fn to_host(guest: &CStr) -> Cow<'_, CStr> {
         // is still a perfectly legal path, so it goes through as it came.
         return Cow::Borrowed(guest);
     };
-    match table.to_host(text).and_then(cstring) {
+    let found = match table.names_mount_elsewhere(text) {
+        true => through_links(table, text, 0).or_else(|| table.to_host(text)),
+        false => table.to_host(text),
+    };
+    match found.and_then(cstring) {
         Some(host) => {
             if tracing() {
                 eprintln!("prefix: to_host {text} -> {}", host.to_string_lossy());
@@ -225,16 +229,72 @@ pub fn to_host(guest: &CStr) -> Cow<'_, CStr> {
     }
 }
 
+/// How many symlinks [`through_links`] follows before giving up, as the
+/// kernel's `MAXSYMLINKS` does.
+const MAX_LINKS: usize = 32;
+
+/// The host path `guest` names once every symlink along it is followed in
+/// guest space rather than by the host kernel, which would not see the mounts
+/// a link leads into. `None` where no link is on the way, or one cannot be
+/// spelled in guest terms.
+fn through_links(table: &mount::Table, guest: &str, depth: usize) -> Option<PathBuf> {
+    if depth > MAX_LINKS {
+        return None;
+    }
+    let parts: Vec<&str> = guest.split('/').filter(|p| !p.is_empty()).collect();
+    let mut walked = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        let here = format!("{walked}/{part}");
+        let host = table.to_host(&here)?;
+        let link = std::fs::symlink_metadata(&host).is_ok_and(|m| m.file_type().is_symlink());
+        if link {
+            let target = std::fs::read_link(&host).ok()?;
+            let target = match target.is_absolute() {
+                true => table.to_guest(&target)?.to_str()?.to_owned(),
+                false => format!("{walked}/{}", target.to_str()?),
+            };
+            let rest = parts[i + 1..].join("/");
+            let next = format!("{}/{rest}", target.trim_end_matches('/'));
+            return through_links(table, &next, depth + 1).or_else(|| table.to_host(&next));
+        }
+        walked = here;
+    }
+    None
+}
+
 /// [`to_host`] for a path interpreted against an open directory descriptor.
 ///
-/// A relative path is left alone: the descriptor it is resolved against is
-/// already a host directory, so mapping it would apply the prefix twice.
+/// A relative path is mostly left alone: the descriptor it is resolved against
+/// is already a host directory, so mapping it would apply the prefix twice.
+/// One that leaves the directory's mount - walking into `/Volumes/Host` from
+/// `/`, as Wine looks a path up one component at a time - is answered with the
+/// absolute host path, which the `*at` call then uses in place of `dirfd`.
 pub fn to_host_at(dirfd: libc::c_int, guest: &CStr) -> Cow<'_, CStr> {
     match guest.to_bytes().first() {
         Some(b'/') => to_host(guest),
         _ if dirfd == libc::AT_FDCWD => to_host(guest),
-        _ => Cow::Borrowed(guest),
+        _ => beneath(dirfd, guest).map_or(Cow::Borrowed(guest), Cow::Owned),
     }
+}
+
+/// The absolute host path a relative `guest` names under `dirfd`, where that
+/// is not what the kernel would resolve. See [`to_host_at`].
+fn beneath(dirfd: libc::c_int, guest: &CStr) -> Option<CString> {
+    let table = table();
+    let text = guest.to_str().ok()?;
+    if !table.may_leave_mount(text) {
+        return None;
+    }
+    let dir = starnix::fd::path(dirfd)?;
+    let host = table.to_host_beneath(&dir, text)?;
+    if tracing() {
+        eprintln!(
+            "prefix: to_host_at {} {text} -> {}",
+            dir.display(),
+            host.display()
+        );
+    }
+    cstring(host)
 }
 
 /// The host path `guest` names, as a [`PathBuf`], for the Rust side of the
