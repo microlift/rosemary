@@ -1111,13 +1111,15 @@ fn snapshot_of(translation: &Translation, start: u64, bytes: &[u8]) -> crate::sm
         // FIXME (ACCURACY): read after the lift rather than by it, so a store to a
         // jump table between the two is missed. Every arena this has met keeps its
         // tables inside the region.
-        // SAFETY: tracked arena memory, which is never unmapped.
-        let live = unsafe {
-            std::slice::from_raw_parts(
-                dep.start as usize as *const u8,
-                (dep.end - dep.start) as usize,
-            )
+        // Copied by the kernel: the arena may have been unmapped since. A table
+        // that is gone is left out, and the region's own bytes then decide.
+        let mut live = vec![0u8; (dep.end - dep.start) as usize];
+        let Ok(at) = usize::try_from(dep.start) else {
+            continue;
         };
+        if starnix::memory::read(at, &mut live).is_err() {
+            continue;
+        }
         ranges.push((dep.start, live.into()));
     }
     crate::smc::Snapshot {

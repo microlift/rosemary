@@ -420,12 +420,19 @@ impl Snapshot {
 fn changed(ranges: &[(u64, Box<[u8]>)]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     for (start, bytes) in ranges {
-        let live = *start as usize as *const u8;
+        // Copied by the kernel, because the guest may have unmapped the arena
+        // since - Wine unmaps a PE image it unloads - and memory that is gone
+        // has changed as far as any translation of it is concerned.
+        let mut live = vec![0u8; bytes.len()];
+        let readable =
+            usize::try_from(*start).is_ok_and(|at| starnix::memory::read(at, &mut live).is_ok());
+        if !readable {
+            out.push((*start, bytes.len() as u64));
+            continue;
+        }
         let mut run: Option<usize> = None;
         for i in 0..=bytes.len() {
-            // SAFETY: arena memory, never unmapped (see `crate::shims::vmmap`).
-            // Volatile because another thread may be storing to it.
-            let differs = i < bytes.len() && unsafe { live.add(i).read_volatile() } != bytes[i];
+            let differs = i < bytes.len() && live[i] != bytes[i];
             match (differs, run) {
                 (true, None) => run = Some(i),
                 (false, Some(from)) => {
