@@ -285,6 +285,12 @@ pub fn send_to_thread(tid: i32, signo: c_int) -> std::io::Result<()> {
     sys::signal::send_to_thread(tid, signo)
 }
 
+/// Send `signo` to thread `tid` of process `pid`, which may be another
+/// process: what a Mach thread port names.
+pub fn send_to_thread_of(pid: i32, tid: i32, signo: c_int) -> std::io::Result<()> {
+    sys::signal::send_to_thread_of(pid, tid, signo)
+}
+
 /// Queue `signo` for process `pid` with `value` attached, which its handler
 /// reads back as [`Info::value`] under [`Code::Queue`]. A host without
 /// `sigqueue` sends a plain signal.

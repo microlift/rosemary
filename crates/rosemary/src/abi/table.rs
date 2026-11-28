@@ -3407,6 +3407,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Signals a *host* thread, which is what a guest thread is here, so the
     // disposition it reaches is the one `shims::signal` installed.
     sig!("pthread_kill", I32, U64, I32),
+    sig!("__pthread_kill", I32, U32, I32),
     // The thread's Mach port name. One task, one port namespace - see
     // `mach_task_self_` in `shims::runtime`.
     sig!("pthread_mach_thread_np", U32, U64),

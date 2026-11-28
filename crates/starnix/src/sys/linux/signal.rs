@@ -284,6 +284,16 @@ pub fn send_to_thread(tid: i32, signo: c_int) -> std::io::Result<()> {
     }
 }
 
+pub fn send_to_thread_of(pid: i32, tid: i32, signo: c_int) -> std::io::Result<()> {
+    // SAFETY: plain integers; naming the process keeps a recycled tid in
+    // another one from being signalled.
+    let rc = unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, signo) };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 pub fn queue(pid: i32, signo: c_int, value: usize) -> std::io::Result<()> {
     let value = libc::sigval {
         sival_ptr: value as *mut c_void,

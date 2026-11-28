@@ -434,6 +434,37 @@ pub unsafe extern "C" fn kill(thread: u64, signal: u64) -> i32 {
     err::from_host(unsafe { libc::pthread_kill(thread_of(thread), host) })
 }
 
+/// `int __pthread_kill(mach_port_t, int)`, the system call beneath
+/// `pthread_kill`, which names the thread by its Mach port and so reaches the
+/// threads of another task too. `-1` and `errno` on failure, as a system call.
+///
+/// # Safety
+///
+/// Called only through an import slot this crate defines.
+pub unsafe extern "C" fn __pthread_kill(thread: crate::mach::space::Name, signal: i32) -> i32 {
+    let host = match signal {
+        0 => 0,
+        s => match crate::signal::signal_to_host(s) {
+            Some(host) => host,
+            None => {
+                crate::errno::set(libc::EINVAL);
+                return -1;
+            }
+        },
+    };
+    let Some((pid, tid)) = crate::mach::space::thread_of(thread) else {
+        crate::errno::set(libc::ESRCH);
+        return -1;
+    };
+    match starnix::signal::send_to_thread_of(pid, tid, host) {
+        Ok(()) => 0,
+        Err(e) => {
+            crate::errno::set(e.raw_os_error().unwrap_or(libc::ESRCH));
+            -1
+        }
+    }
+}
+
 /// FIXME (ACCURACY): are we missing cancellation points anywhere?
 /// are host cancellation points accurate to Darwin?
 pub unsafe extern "C" fn cancel(thread: u64) -> i32 {
@@ -1311,6 +1342,7 @@ exports::exports! {
         "pthread_create" => create,
         "pthread_detach" => detach,
         "pthread_kill" => kill,
+        "__pthread_kill" => __pthread_kill,
         "pthread_cancel" => cancel,
         "pthread_get_stackaddr_np" => get_stackaddr_np,
         "pthread_get_stacksize_np" => get_stacksize_np,

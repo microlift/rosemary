@@ -250,6 +250,10 @@ pub fn send_to_thread(_tid: i32, _signo: c_int) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
+pub fn send_to_thread_of(_pid: i32, _tid: i32, _signo: c_int) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 pub fn queue(pid: i32, signo: c_int, _value: usize) -> std::io::Result<()> {
     // SAFETY: plain values.
     match unsafe { libc::kill(pid, signo) } {

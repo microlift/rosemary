@@ -260,6 +260,14 @@ pub fn send_to_thread(tid: i32, signo: c_int) -> std::io::Result<()> {
     }
 }
 
+pub fn send_to_thread_of(pid: i32, tid: i32, signo: c_int) -> std::io::Result<()> {
+    // SAFETY: plain integers.
+    match unsafe { libc::thr_kill2(pid, libc::c_long::from(tid), signo) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 pub fn queue(pid: i32, signo: c_int, value: usize) -> std::io::Result<()> {
     let value = libc::sigval {
         sival_ptr: value as *mut c_void,
