@@ -1145,6 +1145,16 @@ unsafe extern "C" fn typed_entry(
             // which are the aggregate's own, so its bytes go across unrearranged.
             unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), out, n) };
         }
+        // The start routine of a thread this runtime started called
+        // `pthread_exit`: its value is what the thread's entry returns.
+        Ok(Err(VmError::ThreadExit { value }))
+            if crate::thread::current().is_some_and(|s| s.depth.get() == 0)
+                && crate::thread::started_here() =>
+        {
+            let raw = value.to_le_bytes();
+            // SAFETY: as for a returned value above.
+            unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), out, raw.len()) };
+        }
         Ok(Err(e)) => park_or_die(vm, in_callback(guest_va, e)),
         Err(_) => park_or_die(
             vm,
@@ -1183,7 +1193,7 @@ fn park_or_die(vm: &Vm, err: VmError) {
 /// Name a failure by the callback it happened in - once.
 fn in_callback(guest_va: u64, e: VmError) -> VmError {
     match e {
-        already @ VmError::Callback { .. } => already,
+        already @ (VmError::Callback { .. } | VmError::ThreadExit { .. }) => already,
         e => VmError::Callback {
             guest: guest_va,
             reason: e.to_string(),

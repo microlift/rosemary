@@ -59,6 +59,10 @@ pub enum VmError {
     TooDeep { pc: u64 },
     /// The selected execution backend does not implement what this image needs.
     Unsupported { what: String },
+    /// The guest called `pthread_exit` on a thread this runtime started: not a
+    /// failure, but the way its guest frames are left, to the thread's entry,
+    /// which returns `value` as the thread's result.
+    ThreadExit { value: u64 },
 }
 
 /// How many times the runtime will say the same thing before going quiet.
@@ -187,6 +191,7 @@ impl fmt::Display for VmError {
                 write!(f, "guest re-entered {MAX_DEPTH} deep at {pc:#x}")
             }
             VmError::Unsupported { what } => write!(f, "not supported by this backend: {what}"),
+            VmError::ThreadExit { value } => write!(f, "the thread exited with {value:#x}"),
         }
     }
 }
@@ -1622,7 +1627,9 @@ impl Vm {
         };
         let mut slot = state.pending.borrow_mut();
         if slot.is_none() {
-            say(&err);
+            if !matches!(err, VmError::ThreadExit { .. }) {
+                say(&err);
+            }
             *slot = Some(err);
         }
     }

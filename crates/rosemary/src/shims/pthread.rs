@@ -205,6 +205,18 @@ fn pthread_exit(
             handler(arg);
         }
     }
+    // glibc's `pthread_exit` unwinds the host stack, which a `catch_unwind` in
+    // this runtime between here and the thread's start would catch and abort
+    // on. A thread this runtime started is ended by leaving its guest frames
+    // instead, to its entry, which returns the value.
+    if crate::thread::started_here()
+        && let Some(vm) = crate::thunk::current()
+    {
+        vm.set_pending(crate::vm::VmError::ThreadExit { value });
+        return Ok(());
+    }
+    // FIXME (ACCURACY): on any other thread the host's unwind can still meet
+    // such a `catch_unwind`, and the process aborts.
     // SAFETY: ends the calling thread, as the guest asked, with no guest handler
     // left for the host to find.
     unsafe { libc::pthread_exit(value as usize as *mut core::ffi::c_void) }

@@ -802,13 +802,26 @@ pub fn spawn(start: GuestStart, attr: &libc::pthread_attr_t) -> Result<libc::pth
     Ok(thread)
 }
 
+thread_local! {
+    /// Whether this thread's outermost frame is [`entry`], so that a guest
+    /// `pthread_exit` can end it by returning there.
+    static STARTED_HERE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Whether this runtime started this thread for the guest, rather than the
+/// host or the process's own start.
+pub fn started_here() -> bool {
+    STARTED_HERE.with(|started| started.get())
+}
+
 /// What libpthread calls on the new thread: install the guest state, then enter the
 /// guest.
 extern "C" fn entry(raw: *mut c_void) -> *mut c_void {
+    STARTED_HERE.with(|started| started.set(true));
     // Unboxed before the guest runs, and the fields copied out, because the
-    // guest's start routine may call `pthread_exit` - which ends this thread
-    // from underneath these Rust frames without unwinding them. A `Box` still
-    // live at that moment is a leak once per thread that exits that way.
+    // guest's start routine may call `pthread_exit` - which, on a thread this
+    // runtime did not start, ends it from underneath these Rust frames. A `Box`
+    // still live at that moment is a leak once per thread that exits that way.
     // SAFETY: the pointer came from `Box::into_raw` in `spawn` and is handed to
     // exactly one thread, which is this one.
     let GuestStart {
