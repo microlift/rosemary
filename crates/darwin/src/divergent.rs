@@ -39,6 +39,8 @@ pub const NAMES: &[(&str, &str)] = &[
     ("lstat", STAT),
     ("fstatat", STAT),
     ("statfs", STAT),
+    ("statvfs", STAT),
+    ("fstatvfs", STAT),
     ("fstatfs", STAT),
     ("getfsstat", STAT),
     // `struct dirent`: Darwin has a `d_namlen` glibc has not, so `d_type` and

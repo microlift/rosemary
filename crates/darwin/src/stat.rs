@@ -1254,6 +1254,105 @@ pub unsafe extern "C" fn fstatfs(fd: c_int, out: *mut Statfs) -> c_int {
     result
 }
 
+/// Darwin's `struct statvfs`, whose block and file counts are 32 bits wide.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Statvfs {
+    pub bsize: u64,
+    pub frsize: u64,
+    pub blocks: u32,
+    pub bfree: u32,
+    pub bavail: u32,
+    pub files: u32,
+    pub ffree: u32,
+    pub favail: u32,
+    pub fsid: u64,
+    pub flag: u64,
+    pub namemax: u64,
+}
+
+/// Darwin's `ST_RDONLY` and `ST_NOSUID`.
+const ST_RDONLY: u64 = 0x1;
+const ST_NOSUID: u64 = 0x2;
+
+/// A host `statvfs` in Darwin's layout.
+///
+/// The block counts are scaled into 32 bits by growing the fragment size, so
+/// a large volume reports its true capacity in bigger units rather than a
+/// truncated count of small ones; the file counts are clamped.
+fn as_darwin_statvfs(host: &libc::statvfs) -> Statvfs {
+    let mut frsize = match host.f_frsize {
+        0 => host.f_bsize,
+        frsize => frsize,
+    } as u64;
+    let (mut blocks, mut bfree, mut bavail) = (
+        host.f_blocks as u64,
+        host.f_bfree as u64,
+        host.f_bavail as u64,
+    );
+    while blocks > u64::from(u32::MAX) {
+        frsize <<= 1;
+        blocks >>= 1;
+        bfree >>= 1;
+        bavail >>= 1;
+    }
+    let clamp = |count: u64| count.min(u64::from(u32::MAX)) as u32;
+    let mut flag = 0;
+    if host.f_flag as u64 & libc::ST_RDONLY as u64 != 0 {
+        flag |= ST_RDONLY;
+    }
+    if host.f_flag as u64 & libc::ST_NOSUID as u64 != 0 {
+        flag |= ST_NOSUID;
+    }
+    Statvfs {
+        bsize: host.f_bsize as u64,
+        frsize,
+        blocks: blocks as u32,
+        bfree: bfree as u32,
+        bavail: bavail as u32,
+        files: clamp(host.f_files as u64),
+        ffree: clamp(host.f_ffree as u64),
+        favail: clamp(host.f_favail as u64),
+        fsid: host.f_fsid as u64,
+        flag,
+        namemax: host.f_namemax as u64,
+    }
+}
+
+/// `int statvfs(const char *, struct statvfs *)`
+///
+/// # Safety
+///
+/// `path` is NUL-terminated and `out` is a writable Darwin `struct statvfs`.
+pub unsafe extern "C" fn statvfs(path: *const c_char, out: *mut Statvfs) -> c_int {
+    with_fallback(path, |path| {
+        let mut host = MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the caller's path, and a host-layout buffer.
+        let result = unsafe { libc::statvfs(path, host.as_mut_ptr()) };
+        if result == 0 && !out.is_null() {
+            // SAFETY: filled by the host, and the caller's buffer.
+            unsafe { out.write(as_darwin_statvfs(&host.assume_init())) };
+        }
+        (result, result == 0)
+    })
+}
+
+/// `int fstatvfs(int, struct statvfs *)`
+///
+/// # Safety
+///
+/// As [`statvfs`], with `fd` the caller's descriptor.
+pub unsafe extern "C" fn fstatvfs(fd: c_int, out: *mut Statvfs) -> c_int {
+    let mut host = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the caller's descriptor, and a host-layout buffer.
+    let result = unsafe { libc::fstatvfs(fd, host.as_mut_ptr()) };
+    if result == 0 && !out.is_null() {
+        // SAFETY: filled by the host, and the caller's buffer.
+        unsafe { out.write(as_darwin_statvfs(&host.assume_init())) };
+    }
+    result
+}
+
 /// `int getmntinfo(struct statfs **, int)`.
 ///
 /// The prefix is one host filesystem view for now. Keep the result in static
@@ -1350,6 +1449,8 @@ exports::exports! {
         "fstatat" | "fstatat$INODE64" => fstatat,
         "statfs" | "statfs$INODE64" | "statfs64" => statfs,
         "fstatfs" | "fstatfs$INODE64" | "fstatfs64" => fstatfs,
+        "statvfs" => statvfs,
+        "fstatvfs" => fstatvfs,
         "getmntinfo" | "getmntinfo$INODE64" => getmntinfo,
         "getfsstat" | "getfsstat$INODE64" => getfsstat,
         "devname" => devname,
@@ -1378,6 +1479,26 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn statvfs_is_darwins_sixty_four_bytes() {
+        assert_eq!(std::mem::size_of::<Statvfs>(), 64);
+        assert_eq!(std::mem::offset_of!(Statvfs, fsid), 40);
+    }
+
+    // A macOS host's own counts are already 32 bits wide.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_volume_too_large_for_thirty_two_bits_keeps_its_capacity() {
+        // SAFETY: a plain-data host struct, all zero.
+        let mut host: libc::statvfs = unsafe { std::mem::zeroed() };
+        host.f_frsize = 4096;
+        host.f_blocks = 1 << 33;
+        host.f_bavail = 1 << 32;
+        let ours = as_darwin_statvfs(&host);
+        assert_eq!(ours.frsize * u64::from(ours.blocks), 4096 << 33);
+        assert_eq!(ours.frsize * u64::from(ours.bavail), 4096 << 32);
+    }
 
     /// Except the three whose plain names are the legacy layout on x86-64.
     #[test]
