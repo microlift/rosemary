@@ -1789,6 +1789,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Clang's stack-clash probe. It has no arguments and no result; it only
     // touches the guest stack before the function's body continues.
     sig!("___chkstk_darwin", V),
+    sig!("_thread_set_tsd_base", V, P),
     //
     // The `_l` family and the wide-character calls libc++ reaches on the same
     // paths, scattered through this table by name.

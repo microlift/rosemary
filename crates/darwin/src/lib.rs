@@ -370,6 +370,7 @@ static SHARED_MODULES: &[exports::Module] = &[
     stat::MODULE,
     fcntl::entry::MODULE,
     stackprobe::MODULE,
+    tls::MODULE,
     atomics::MODULE,
     unfair_lock::MODULE,
     fortify::MODULE,

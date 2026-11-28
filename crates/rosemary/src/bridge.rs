@@ -175,10 +175,23 @@ fn no_vm(what: &str) -> ! {
 ///
 /// Under high-level emulation the host's libSystem issues the real syscalls
 /// natively, so a guest `syscall` means hand-written assembly and there is nothing
-/// to forward it to. The PC is the return address, as it was on the old exit.
+/// to forward it to - except for the machine-dependent trap that sets `%gs`, which
+/// only the guest context can carry out. The PC is the return address, as it was
+/// on the old exit.
 unsafe extern "C" fn syscall(ctx: *mut RegisterContext) {
+    use darwin::syscall::numbers::{SYSCALL_CLASS_MDEP, mdep};
+
     // SAFETY: as in `import_call`.
     let ctx = unsafe { &mut *ctx };
+    if darwin::syscall::split_syscall_number(ctx.rax)
+        == (SYSCALL_CLASS_MDEP, mdep::thread_fast_set_cthread_self64)
+    {
+        crate::shims::tsd::set_cthread_self(ctx, ctx.rdi);
+        // FIXME (ACCURACY): xnu returns the `USER_CTHREAD` selector, which a
+        // 64-bit caller never reads.
+        ctx.rax = 0;
+        return;
+    }
     let Some(vm) = crate::thunk::current() else {
         no_vm("a guest syscall")
     };

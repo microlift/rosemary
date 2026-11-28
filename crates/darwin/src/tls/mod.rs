@@ -300,6 +300,28 @@ impl Drop for HostThread {
     }
 }
 
+/// `void _thread_set_tsd_base(void *)`: point this thread's Darwin thread
+/// register somewhere else, as Wine does to make `%gs` its TEB.
+///
+/// FIXME (ACCURACY): host code that enters guest code again reinstalls the
+/// Darwin array, where on Darwin the register keeps whatever was last set.
+pub unsafe extern "C" fn _thread_set_tsd_base(base: *mut core::ffi::c_void) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = base;
+        eprintln!("rosemary: _thread_set_tsd_base: the host owns this thread's register");
+        std::process::abort();
+    }
+    #[cfg(not(target_os = "macos"))]
+    set_thread_pointer(base as usize as u64);
+}
+
+exports::exports! {
+    functions {
+        "_thread_set_tsd_base" => _thread_set_tsd_base,
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[inline(always)]
 fn set_thread_pointer(base: u64) {
