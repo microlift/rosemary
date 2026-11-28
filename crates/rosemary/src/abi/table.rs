@@ -462,6 +462,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFURLEnumeratorGetNextURL", I64, P, P, P),
     sig!("CFURLCreateFromFSRef", P, P, P),
     sig!("CFURLGetFSRef", BOOL, P, P),
+    sig!("CFURLCopyResourcePropertyForKey", BOOL, P, P, P, P),
+    sig!("CFURLCopyResourcePropertiesForKeys", P, P, P, P),
     sig!("CFURLSetResourcePropertyForKey", BOOL, P, P, P, P),
     sig!("CFURLResourceIsReachable", BOOL, P, P),
     sig!("CFURLCheckResourceIsReachable", BOOL, P, P),
@@ -785,6 +787,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `Boolean` - the two narrow types this family keeps getting wrong in the
     // direction that does not fault.
     sig!("CFURLCreateWithFileSystemPath", P, P, P, I64, BOOL),
+    sig!(
+        "CFURLCreateFromFileSystemRepresentation",
+        P,
+        P,
+        P,
+        I64,
+        BOOL
+    ),
+    sig!(
+        "CFURLCreateFromFileSystemRepresentationRelativeToBase",
+        P,
+        P,
+        P,
+        I64,
+        BOOL,
+        P
+    ),
     sig!("CFURLCreateCopyAppendingPathComponent", P, P, P, P, BOOL),
     sig!("CFURLCreateCopyDeletingLastPathComponent", P, P, P),
     sig!("CFURLCreateCopyDeletingPathExtension", P, P, P),
