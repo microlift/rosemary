@@ -49,7 +49,10 @@ unsafe extern "C" fn chkstk() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 exports::exports! {
     functions {
+        // arm64's compiler calls the first and x86-64's the second; the
+        // emulated x86-64 guest reaches its own probe through a shim.
         "__chkstk_darwin" => chkstk,
+        "___chkstk_darwin" => chkstk,
     }
 }
 
