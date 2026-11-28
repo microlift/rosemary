@@ -966,30 +966,28 @@ impl<M: Regions> Program<M> {
         let mut config = lifter_config_base();
         // A mapped region is a whole image's reservation, spanning segments of
         // both kinds, so it is cut at the writable segments' edges rather than
-        // handed over whole.
+        // handed over whole. Only the read-only pieces are copied: the lifter
+        // reads nothing from a writable one, treating a load from it as it does
+        // one from outside every segment, and a zero-fill reservation such as
+        // Wine's 8 GiB `WINE_RESERVE` is too large to copy at all.
         let writable = self.writable_ranges();
         let mut segments: Vec<MemorySegment> = Vec::new();
         for (base, bytes) in self.memory.regions() {
             let end = base.wrapping_add(bytes.len() as u64);
-            let mut piece = |from: u64, to: u64, is_writable: bool| {
+            let mut piece = |from: u64, to: u64| {
                 let (lo, hi) = ((from - base) as usize, (to - base) as usize);
-                segments.push(MemorySegment::new(
-                    from,
-                    bytes[lo..hi].to_vec(),
-                    is_writable,
-                ));
+                segments.push(MemorySegment::new(from, bytes[lo..hi].to_vec(), false));
             };
             let mut at = base;
             for range in writable.iter().filter(|r| r.start < end && r.end > base) {
                 let (start, stop) = (range.start.max(base), range.end.min(end));
                 if at < start {
-                    piece(at, start, false);
+                    piece(at, start);
                 }
-                piece(start, stop, true);
                 at = stop;
             }
             if at < end {
-                piece(at, end, false);
+                piece(at, end);
             }
         }
         // Set rather than pushed one by one, because the field is shared.
