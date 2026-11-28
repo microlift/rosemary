@@ -10,7 +10,11 @@ const MAX_LEN: usize = 15;
 
 /// Perform `count` guest instructions from the context's PC, leaving it past the
 /// last of them.
-pub fn run(ctx: &mut RegisterContext, mem: &dyn GuestMemory, count: u64) -> Result<(), VmError> {
+pub fn run(
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    count: u64,
+) -> Result<(), VmError> {
     for _ in 0..count {
         step(ctx, mem)?;
     }
@@ -18,14 +22,18 @@ pub fn run(ctx: &mut RegisterContext, mem: &dyn GuestMemory, count: u64) -> Resu
 }
 
 /// Perform the one instruction at the context's PC.
-fn step(ctx: &mut RegisterContext, mem: &dyn GuestMemory) -> Result<(), VmError> {
+fn step(ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<(), VmError> {
     let at = ctx.rip;
-    let instruction = decode_at(at, mem).ok_or(VmError::Interpret {
+    let instruction = decode_at(at, &*mem).ok_or(VmError::Interpret {
         pc: at,
         what: "nothing decodes there".into(),
     })?;
     match instruction.mnemonic() {
         Mnemonic::Cmpxchg16b => crate::atomic128::service(ctx, &instruction)?,
+        Mnemonic::Fxsave64 => crate::fxsave::service(ctx, mem, &instruction, true)?,
+        Mnemonic::Fxrstor64 => crate::fxsave::service(ctx, mem, &instruction, false)?,
+        // A control transfer, which leaves the PC where it went.
+        Mnemonic::Iretq => return crate::iret::service(ctx, &*mem),
         // `Debug` is the enum variant, which is the mnemonic *plus* its operand
         // shape - `Vsqrtsd_xmm_xmm_xmmm64` rather than just `vsqrtsd` - and so
         // names the lowering the recompiler is actually missing.
@@ -113,7 +121,7 @@ mod tests {
     fn a_cmpxchg16b_is_performed_and_stepped_over() {
         let mut cell = Aligned(0);
         // `lock cmpxchg16b [rdi]`, the one instruction this module performs.
-        let mem = Bytes {
+        let mut mem = Bytes {
             at: 0x1000,
             bytes: vec![0xF0, 0x48, 0x0F, 0xC7, 0x0F],
         };
@@ -126,14 +134,14 @@ mod tests {
         ctx.rbx = 7;
         ctx.rcx = 9;
 
-        run(&mut ctx, &mem, 1).expect("the swap");
+        run(&mut ctx, &mut mem, 1).expect("the swap");
         assert_eq!(cell.0, u128::from(7u64) | (u128::from(9u64) << 64));
         assert_eq!(ctx.zf, 1, "a matching pair sets ZF");
         assert_eq!(ctx.rip, 0x1005, "and the PC is past the instruction");
 
         // And again, now that the pair no longer matches.
         ctx.rip = 0x1000;
-        run(&mut ctx, &mem, 1).expect("the compare");
+        run(&mut ctx, &mut mem, 1).expect("the compare");
         assert_eq!(ctx.zf, 0);
         assert_eq!((ctx.rax, ctx.rdx), (7, 9), "which reads the pair back");
     }
@@ -142,7 +150,7 @@ mod tests {
     fn a_run_is_performed_in_order_up_to_a_refused_instruction() {
         let mut cell = Aligned(0);
         // Two `lock cmpxchg16b [rdi]`, then a `ud0` this module has no case for.
-        let mem = Bytes {
+        let mut mem = Bytes {
             at: 0x1000,
             bytes: vec![
                 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0x0F, 0xFF, 0xC0,
@@ -154,7 +162,7 @@ mod tests {
         ctx.rbx = 7;
         ctx.rcx = 9;
 
-        let err = run(&mut ctx, &mem, 3).expect_err("no case for the third");
+        let err = run(&mut ctx, &mut mem, 3).expect_err("no case for the third");
         let VmError::Interpret { pc, .. } = err else {
             panic!("wrong error: {err}");
         };
@@ -171,13 +179,13 @@ mod tests {
     #[test]
     fn an_instruction_the_host_does_not_perform_is_named() {
         // `ud0`, which decodes and which this module has no case for.
-        let mem = Bytes {
+        let mut mem = Bytes {
             at: 0x2000,
             bytes: vec![0x0F, 0xFF, 0xC0],
         };
         let mut ctx = RegisterContext::new();
         ctx.rip = 0x2000;
-        let err = step(&mut ctx, &mem).expect_err("no case for it");
+        let err = step(&mut ctx, &mut mem).expect_err("no case for it");
         let VmError::Interpret { pc, what } = err else {
             panic!("wrong error: {err}");
         };

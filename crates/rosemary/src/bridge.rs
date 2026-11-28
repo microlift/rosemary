@@ -217,7 +217,7 @@ unsafe extern "C" fn interpret(ctx: *mut RegisterContext, instructions: u64) {
     // `AssertUnwindSafe` for the reason `caught` gives: a panic here is a bug in
     // this runtime, and one worth reporting rather than aborting on.
     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::interp::run(ctx, vm.view(), instructions)
+        crate::interp::run(ctx, &mut vm.view(), instructions)
     }));
     match done {
         Ok(Ok(())) => {}

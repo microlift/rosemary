@@ -124,7 +124,7 @@ unsafe fn compare_exchange(at: *mut u128, expected: u128, desired: u128) -> u128
 }
 
 /// The address the memory operand names, from the guest's own registers.
-fn effective_address(instruction: &Instruction, ctx: &RegisterContext) -> Option<u64> {
+pub(crate) fn effective_address(instruction: &Instruction, ctx: &RegisterContext) -> Option<u64> {
     if instruction.segment_prefix() != Register::None {
         return None;
     }
