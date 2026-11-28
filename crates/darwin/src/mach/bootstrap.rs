@@ -202,6 +202,29 @@ pub unsafe extern "C" fn bootstrap_register(bp: Name, service: *const c_char, po
     }
 }
 
+/// `kern_return_t bootstrap_register2(mach_port_t bp, const char *service,
+/// mach_port_t sp, uint64_t flags)`
+///
+/// [`bootstrap_register`] with flags. `BOOTSTRAP_PER_PID_SERVICE`, the only
+/// one, asks for a namespace per process this one does not keep, so it is
+/// refused rather than registered globally.
+///
+/// # Safety
+///
+/// As [`bootstrap_register`].
+pub unsafe extern "C" fn bootstrap_register2(
+    bp: Name,
+    service: *const c_char,
+    port: Name,
+    flags: u64,
+) -> i32 {
+    if flags != 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller's, as documented.
+    unsafe { bootstrap_register(bp, service, port) }
+}
+
 /// `kern_return_t bootstrap_parent(mach_port_t bp, mach_port_t *parent)`
 ///
 /// There is one namespace here, so it is its own parent.

@@ -40,6 +40,7 @@ pub const MACH_SEND_TOO_LARGE: i32 = 0x1000_0014u32 as i32;
 pub const MACH_RCV_INVALID_NAME: i32 = 0x1000_4002u32 as i32;
 pub const MACH_RCV_TIMED_OUT: i32 = 0x1000_4003u32 as i32;
 pub const MACH_RCV_TOO_LARGE: i32 = 0x1000_4004u32 as i32;
+pub const MACH_RCV_INVALID_DATA: i32 = 0x1000_4008u32 as i32;
 pub const MACH_RCV_BODY_ERROR: i32 = 0x1000_400eu32 as i32;
 
 /// `MACH_MSG_VM_*`: what a receive that delivered a message but could not
@@ -94,6 +95,7 @@ pub fn describe(code: i32) -> Option<&'static str> {
         MACH_RCV_INVALID_NAME => "(ipc/rcv) invalid name",
         MACH_RCV_TIMED_OUT => "(ipc/rcv) receive timed out",
         MACH_RCV_TOO_LARGE => "(ipc/rcv) message too large",
+        MACH_RCV_INVALID_DATA => "(ipc/rcv) invalid data",
         MACH_RCV_BODY_ERROR => "(ipc/rcv) bad message body",
         _ => return None,
     })

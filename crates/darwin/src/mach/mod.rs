@@ -196,6 +196,8 @@ exports::exports! {
         "vm_copy" | "mach_vm_copy" => vm::vm_copy,
 
         "mach_msg" => msg::mach_msg,
+        "mach_msg_send" => msg::mach_msg_send,
+        "mach_msg_receive" => msg::mach_msg_receive,
         "mach_msg_overwrite" => msg::mach_msg_overwrite,
         "mach_msg_destroy" => msg::mach_msg_destroy,
         "mig_get_reply_port" => msg::mig_get_reply_port,
@@ -206,6 +208,7 @@ exports::exports! {
         "bootstrap_look_up" => bootstrap::bootstrap_look_up,
         "bootstrap_look_up2" => bootstrap::bootstrap_look_up2,
         "bootstrap_register" => bootstrap::bootstrap_register,
+        "bootstrap_register2" => bootstrap::bootstrap_register2,
         "bootstrap_parent" => bootstrap::bootstrap_parent,
 
         "semaphore_create" => sync::semaphore_create,

@@ -3103,6 +3103,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // client. They need no translation at all.
     sig!("mach_msg", I32, P, I32, U32, U32, U32, U32, U32),
     sig!("mach_msg_destroy", V, P),
+    sig!("mach_msg_send", I32, P),
+    sig!("mach_msg_receive", I32, P),
     sig!("mach_port_allocate", I32, U32, U32, P),
     sig!("mach_port_deallocate", I32, U32, U32),
     // `kern_return_t mach_port_extract_right(ipc_space_t, mach_port_name_t,
@@ -4269,6 +4271,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("task_set_special_port", I32, U32, I32, U32),
     sig!("semaphore_signal_thread", I32, U32, U32),
     sig!("bootstrap_register", I32, U32, P, U32),
+    sig!("bootstrap_register2", I32, U32, P, U32, U64),
     sig!("bootstrap_look_up2", I32, U32, P, P, I32, U64),
     sig!("bootstrap_parent", I32, U32, P),
     //

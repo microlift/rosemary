@@ -1186,6 +1186,49 @@ unsafe fn write_header(msg: *mut u8, bits: u32, size: u32, remote: Name, local: 
     }
 }
 
+/// Where `msgh_size` and `msgh_local_port` sit in a `mach_msg_header_t`.
+const SIZE_AT: usize = 4;
+const LOCAL_PORT_AT: usize = 12;
+
+/// `mach_msg_return_t mach_msg_send(mach_msg_header_t *)`: [`mach_msg`]'s send
+/// half, of the size the header states, with no timeout.
+///
+/// # Safety
+///
+/// `msg` addresses a whole message of the size its header states.
+pub unsafe extern "C" fn mach_msg_send(msg: *mut c_void) -> i32 {
+    if msg.is_null() {
+        return MACH_SEND_INVALID_DATA;
+    }
+    // SAFETY: the caller's header.
+    let size = unsafe { msg.cast::<u8>().add(SIZE_AT).cast::<u32>().read_unaligned() };
+    // SAFETY: the caller's obligation.
+    unsafe { mach_msg(msg, SEND_MSG, size, 0, MACH_PORT_NULL, 0, MACH_PORT_NULL) }
+}
+
+/// `mach_msg_return_t mach_msg_receive(mach_msg_header_t *)`: [`mach_msg`]'s
+/// receive half, into a buffer of the header's `msgh_size` on its
+/// `msgh_local_port`, with no timeout.
+///
+/// # Safety
+///
+/// `msg` addresses a writable buffer of the size its header states.
+pub unsafe extern "C" fn mach_msg_receive(msg: *mut c_void) -> i32 {
+    if msg.is_null() {
+        return MACH_RCV_INVALID_DATA;
+    }
+    let header = msg.cast::<u8>();
+    // SAFETY: the caller's header.
+    let (size, local) = unsafe {
+        (
+            header.add(SIZE_AT).cast::<u32>().read_unaligned(),
+            header.add(LOCAL_PORT_AT).cast::<Name>().read_unaligned(),
+        )
+    };
+    // SAFETY: the caller's obligation.
+    unsafe { mach_msg(msg, RCV_MSG, 0, size, local, 0, MACH_PORT_NULL) }
+}
+
 /// `mach_msg_return_t mach_msg(mach_msg_header_t *msg, mach_msg_option_t option,
 /// mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t
 /// rcv_name, mach_msg_timeout_t timeout, mach_port_name_t notify)`
